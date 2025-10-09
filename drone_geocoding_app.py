@@ -1,8 +1,81 @@
 import streamlit as st
-from geopy.geocoders import ArcGIS
+from geopy.geocoders import ArcGIS, Nominatim
 from rapidfuzz import process as rf_process, fuzz as rf_fuzz
 import folium
 from PIL import Image
+import os
+import io
+import wave
+import numpy as np
+from openai import OpenAI
+from streamlit_webrtc import webrtc_streamer, WebRtcMode
+
+# --- Voice via Browser (WebRTC + Whisper API) ---
+def record_and_transcribe_with_whisper() -> str | None:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        st.error("ไม่พบ OPENAI_API_KEY ในสภาพแวดล้อม โปรดตั้งค่าสำหรับใช้ Whisper API")
+        return None
+
+    ctx = webrtc_streamer(
+        key="voice-web",
+        mode=WebRtcMode.SENDONLY,
+        audio_receiver_size=256,
+        media_stream_constraints={"audio": True, "video": False},
+        async_processing=False,
+    )
+
+    if not ctx.state.playing:
+        st.info("กด Start เพื่อเริ่มบันทึกเสียง แล้วกด Stop เพื่อส่งไปถอดเสียง")
+        return None
+
+    # เก็บตัวอย่างเสียงสั้นๆ
+    frames = []
+    audio_receiver = ctx.audio_receiver
+    if audio_receiver:
+        while True:
+            data = audio_receiver.get_frames(timeout=1)
+            for frame in data:
+                frames.append(frame.to_ndarray().astype("float32"))
+            # จำกัดความยาวเพื่อเดโม ~3 วินาที
+            if len(frames) > 30:
+                break
+
+    if not frames:
+        return None
+
+    # แปลงเป็น wav (mono, 16k)
+    samples = np.concatenate(frames, axis=0)
+    if samples.ndim > 1:
+        samples = samples.mean(axis=1)
+    # รีแซมเปิลอย่างง่าย (ถ้า sample rate ไม่ตรง จะใช้โหมดนี้ชั่วคราว)
+    # ที่นี่สมมติ 16000 Hz สำหรับความง่าย
+    sample_rate = 16000
+    # นอร์มัลไลซ์เป็น int16
+    wav_bytes = io.BytesIO()
+    with wave.open(wav_bytes, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes((samples * 32767).clip(-32768, 32767).astype("int16").tobytes())
+    wav_bytes.seek(0)
+
+    client = OpenAI(api_key=api_key)
+    try:
+        # ใช้ Whisper-1 transcription
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=("audio.wav", wav_bytes, "audio/wav"),
+            response_format="text",
+            language="th"
+        )
+        text = transcript.strip()
+        if text:
+            st.success(f"📝 คำสั่งเสียง: '{text}'")
+            return text
+    except Exception as e:
+        st.error(f"ถอดเสียงไม่สำเร็จ: {e}")
+    return None
 
 # --- 1. ฐานข้อมูลความรู้ (Knowledge Base) และ Fuzzy Matching Logic ---
 
@@ -48,9 +121,14 @@ def geocode_and_map(location_to_search, user_input):
     st.info(f"🚀 กำลังค้นหาพิกัดของ: **{clean_query}**")
     
     # ใช้งาน Geocoding API (ArcGIS)
-    geolocator = ArcGIS(user_agent="arcgis_fuzzy_app")
+    geolocator_arcgis = ArcGIS(user_agent="arcgis_fuzzy_app")
+    geolocator_nominatim = Nominatim(user_agent="nominatim_fuzzy_app")
     try:
-        location = geolocator.geocode(clean_query, timeout=5)
+        # 1) Try ArcGIS first
+        location = geolocator_arcgis.geocode(clean_query, timeout=8)
+        # 2) If ArcGIS fails, try Nominatim
+        if not location:
+            location = geolocator_nominatim.geocode(clean_query, timeout=8)
     except Exception as e:
         st.error(f"🚨 ข้อผิดพลาดในการติดต่อ API: โปรดตรวจสอบอินเทอร์เน็ต ({e})")
         return
@@ -84,7 +162,7 @@ def geocode_and_map(location_to_search, user_input):
         st.caption(f"ตำแหน่งที่แม่นยำ: {location.address}")
         
     else:
-        st.warning(f"🚨 ArcGIS ไม่พบพิกัดสำหรับ '{location_to_search}'")
+        st.warning(f"🚨 ไม่พบพิกัดสำหรับ '{location_to_search}' จากผู้ให้บริการที่ใช้")
         st.caption("โปรดลองใช้ชื่อที่เฉพาะเจาะจงมากขึ้น")
 
 
@@ -112,9 +190,14 @@ def geocode_location(location_to_search, user_input):
         return
 
     st.info(f"🚀 กำลังค้นหาพิกัดของ: **{clean_query}**")
-    geolocator = ArcGIS(user_agent="arcgis_fuzzy_app_v2")
+    geolocator_arcgis = ArcGIS(user_agent="arcgis_fuzzy_app_v2")
+    geolocator_nominatim = Nominatim(user_agent="nominatim_fuzzy_app_v2")
     try:
-        location = geolocator.geocode(clean_query, timeout=10)
+        # ArcGIS first
+        location = geolocator_arcgis.geocode(clean_query, timeout=10)
+        # Fallback to Nominatim
+        if not location:
+            location = geolocator_nominatim.geocode(clean_query, timeout=10)
     except Exception as e:
         st.error(f"🚨 ข้อผิดพลาดในการติดต่อ API: โปรดตรวจสอบอินเทอร์เน็ต ({e})")
         st.session_state['latitude'] = None
@@ -153,6 +236,12 @@ with col1:
 
     if st.button("🔎 ค้นหาพิกัด", use_container_width=True):
         process_and_search(typed_input)
+    # ปุ่มพูดคำสั่ง (เว็บ) ใช้เบราว์เซอร์ + Whisper API
+    if st.button("🎙️ พูดคำสั่ง (เว็บ)", use_container_width=True):
+        spoken = record_and_transcribe_with_whisper()
+        if spoken:
+            st.session_state.location_input = spoken
+            process_and_search(spoken)
 
     # แสดงผลลัพธ์ตัวเลขคงอยู่ถ้ามีใน state
     if st.session_state.latitude:
