@@ -5,5 +5,3 @@ rapidfuzz
 folium==0.17.0
 streamlit-folium==0.20.0
 Pillow==10.4.0
-openai>=1.43.0
-streamlit-webrtc==0.47.7

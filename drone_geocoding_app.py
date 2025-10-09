@@ -18,9 +18,6 @@ def handle_voice_query_once():
             st.query_params.clear()
         except Exception:
             pass
-    # ถ้าไม่เจอ voice query ให้รีเซ็ตธง เพื่อให้ครั้งต่อไปทำงานได้
-    elif not voice_q:
-        st.session_state['_voice_processed'] = False
 
 import streamlit as st
 from geopy.geocoders import ArcGIS, Nominatim
@@ -28,79 +25,9 @@ from rapidfuzz import process as rf_process, fuzz as rf_fuzz
 import folium
 from PIL import Image
 import os
-import io
-import wave
-import numpy as np
-from openai import OpenAI
-from streamlit_webrtc import webrtc_streamer, WebRtcMode
 import streamlit.components.v1 as components
 
-# --- Voice via Browser (WebRTC + Whisper API) ---
-def record_and_transcribe_with_whisper() -> str | None:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        st.error("ไม่พบ OPENAI_API_KEY ในสภาพแวดล้อม โปรดตั้งค่าสำหรับใช้ Whisper API")
-        return None
-
-    ctx = webrtc_streamer(
-        key="voice-web",
-        mode=WebRtcMode.SENDONLY,
-        audio_receiver_size=256,
-        media_stream_constraints={"audio": True, "video": False},
-        async_processing=False,
-    )
-
-    if not ctx.state.playing:
-        st.info("กด Start เพื่อเริ่มบันทึกเสียง แล้วกด Stop เพื่อส่งไปถอดเสียง")
-        return None
-
-    # เก็บตัวอย่างเสียงสั้นๆ
-    frames = []
-    audio_receiver = ctx.audio_receiver
-    if audio_receiver:
-        while True:
-            data = audio_receiver.get_frames(timeout=1)
-            for frame in data:
-                frames.append(frame.to_ndarray().astype("float32"))
-            # จำกัดความยาวเพื่อเดโม ~3 วินาที
-            if len(frames) > 30:
-                break
-
-    if not frames:
-        return None
-
-    # แปลงเป็น wav (mono, 16k)
-    samples = np.concatenate(frames, axis=0)
-    if samples.ndim > 1:
-        samples = samples.mean(axis=1)
-    # รีแซมเปิลอย่างง่าย (ถ้า sample rate ไม่ตรง จะใช้โหมดนี้ชั่วคราว)
-    # ที่นี่สมมติ 16000 Hz สำหรับความง่าย
-    sample_rate = 16000
-    # นอร์มัลไลซ์เป็น int16
-    wav_bytes = io.BytesIO()
-    with wave.open(wav_bytes, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes((samples * 32767).clip(-32768, 32767).astype("int16").tobytes())
-    wav_bytes.seek(0)
-
-    client = OpenAI(api_key=api_key)
-    try:
-        # ใช้ Whisper-1 transcription
-        transcript = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=("audio.wav", wav_bytes, "audio/wav"),
-            response_format="text",
-            language="th"
-        )
-        text = transcript.strip()
-        if text:
-            st.success(f"📝 คำสั่งเสียง: '{text}'")
-            return text
-    except Exception as e:
-        st.error(f"ถอดเสียงไม่สำเร็จ: {e}")
-    return None
+# (โหมด Whisper/WebRTC ถูกถอดออก — ใช้ Web Speech API ในเบราว์เซอร์แทน)
 
 # --- 1. ฐานข้อมูลความรู้ (Knowledge Base) และ Fuzzy Matching Logic ---
 
