@@ -1,3 +1,24 @@
+# ตรวจจับข้อความจากพารามิเตอร์ใน URL (จากคอมโพเนนต์เสียงฝั่งเบราว์เซอร์)
+def handle_voice_query_once():
+    try:
+        qp = st.query_params  # Streamlit >= 1.27
+    except Exception:
+        qp = {}
+    voice_q = qp.get('voice') if isinstance(qp, dict) else None
+    if isinstance(voice_q, list):
+        voice_q = voice_q[0] if voice_q else None
+
+    # ป้องกันรันซ้ำหลังรีเฟรชด้วย state flag
+    if voice_q and not st.session_state.get('_voice_processed'):
+        st.session_state['_voice_processed'] = True
+        st.session_state.location_input = voice_q
+        process_and_search(voice_q)
+        # ล้างพารามิเตอร์เพื่อไม่ให้วนซ้ำ
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+
 import streamlit as st
 from geopy.geocoders import ArcGIS, Nominatim
 from rapidfuzz import process as rf_process, fuzz as rf_fuzz
@@ -183,24 +204,6 @@ if 'latitude' not in st.session_state:
     st.session_state['address'] = None
     st.session_state['user_input'] = None
 
-# ตรวจจับข้อความจากพารามิเตอร์ใน URL (จากคอมโพเนนต์เสียงฝั่งเบราว์เซอร์)
-try:
-    qp = st.query_params  # Streamlit >= 1.27
-except Exception:
-    qp = {}
-voice_q = qp.get('voice') if isinstance(qp, dict) else None
-if isinstance(voice_q, list):
-    voice_q = voice_q[0] if voice_q else None
-if voice_q:
-    st.session_state.location_input = voice_q
-    process_text = voice_q
-    # ล้างพารามิเตอร์เพื่อไม่ให้วนซ้ำ
-    try:
-        st.query_params.clear()
-    except Exception:
-        pass
-    # จะเรียกค้นหาหลังจาก UI ส่วนอินพุตถูกเรนเดอร์แล้วด้านล่าง
-
 # ฟังก์ชัน Geocoding ที่จะบันทึกผลลัพธ์ลง session_state
 def geocode_location(location_to_search, user_input):
     clean_query = (location_to_search or "").strip()
@@ -253,6 +256,9 @@ with col1:
     st.subheader("1. ป้อนคำสั่ง")
     typed_input = st.text_input("พิมพ์ชื่อสถานที่ (เช่น: มอกะเสด)", key="location_input")
 
+    # จัดการพารามิเตอร์ voice ก่อนเพื่อให้ค้นหาทันทีหลัง reload
+    handle_voice_query_once()
+
     if st.button("🔎 ค้นหาพิกัด", use_container_width=True):
         process_and_search(typed_input)
     # ปุ่มพูดคำสั่ง (เบราว์เซอร์ ไม่ใช้ API key)
@@ -289,10 +295,7 @@ with col1:
         st.subheader("ผลการค้นหา")
         st.code(f"ละติจูด (L): {st.session_state.latitude}\nลองจิจูด (R): {st.session_state.longitude}")
         st.caption(f"ตำแหน่งที่แม่นยำ: {st.session_state.address}")
-    # หากมีข้อความจากพารามิเตอร์เสียง ให้ประมวลผลทันทีครั้งเดียว
-    if 'process_text' in locals() and process_text:
-        process_and_search(process_text)
-        process_text = None
+    # ไม่มีการประมวลผลซ้ำที่นี่แล้ว เพราะ handle_voice_query_once() จัดการให้ก่อน
 
     st.subheader("2. ฟังก์ชันเสริมโครงการโดรน")
     # อัปโหลดภาพ
