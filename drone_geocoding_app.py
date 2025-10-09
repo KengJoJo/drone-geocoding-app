@@ -124,6 +124,39 @@ st.title("🗺️ ระบบค้นหาพิกัดสถานที�
 st.caption("ระบบรองรับการป้อนคำสั่งแบบ Hybrid (พิมพ์/เสียง) และแก้ไขคำผิดโดยอัตโนมัติ")
 st.markdown("---")
 
+# ค่า state เริ่มต้น สำหรับผลลัพธ์การค้นหา
+if 'latitude' not in st.session_state:
+    st.session_state['latitude'] = None
+    st.session_state['longitude'] = None
+    st.session_state['address'] = None
+    st.session_state['user_input'] = None
+
+# ฟังก์ชัน Geocoding ที่จะบันทึกผลลัพธ์ลง session_state
+def geocode_location(location_to_search, user_input):
+    clean_query = (location_to_search or "").strip()
+    if not clean_query:
+        st.warning("โปรดป้อนชื่อสถานที่ที่ไม่ว่าง")
+        return
+
+    st.info(f"🚀 กำลังค้นหาพิกัดของ: **{clean_query}**")
+    geolocator = ArcGIS(user_agent="arcgis_fuzzy_app_v2")
+    try:
+        location = geolocator.geocode(clean_query, timeout=10)
+    except Exception as e:
+        st.error(f"🚨 ข้อผิดพลาดในการติดต่อ API: โปรดตรวจสอบอินเทอร์เน็ต ({e})")
+        st.session_state['latitude'] = None
+        return
+
+    if location:
+        st.success("✅ ค้นพบพิกัดแล้ว!")
+        st.session_state['latitude'] = location.latitude
+        st.session_state['longitude'] = location.longitude
+        st.session_state['address'] = location.address
+        st.session_state['user_input'] = user_input
+    else:
+        st.warning(f"🚨 ArcGIS ไม่พบพิกัดสำหรับ '{clean_query}'")
+        st.session_state['latitude'] = None
+
 # ฟังก์ชันกลางสำหรับประมวลผลและค้นหา
 def process_and_search(user_input):
     if not (user_input or "").strip():
@@ -135,34 +168,60 @@ def process_and_search(user_input):
         st.success(f"🤖 AI แก้ไขคำผิดสำเร็จ: '{user_input}' ถูกเปลี่ยนเป็น '{matched_name}' (คะแนน: {score}%)")
     else:
         st.warning("⚠️ ไม่พบคำใกล้เคียงในฐานข้อมูล. ค้นหาด้วยคำที่ป้อนโดยตรง.")
-    geocode_and_map(location_to_search, user_input)
+    geocode_location(location_to_search, user_input)
 
 
-# ส่วนรับ Input สำหรับการพิมพ์
-st.subheader("1. ป้อนชื่อสถานที่")
-typed_input = st.text_input("พิมพ์ชื่อสถานที่ที่ต้องการค้นหา (เช่น: มอกะเสด)", key="location_input")
+col1, col2 = st.columns([1, 1])
 
-# ปุ่มค้นหา
-if st.button("🔎 ค้นหาพิกัด"):
-    process_and_search(typed_input)
+# คอลัมน์ซ้าย: อินพุตและผลลัพธ์ตัวเลข
+with col1:
+    st.subheader("1. ป้อนคำสั่ง")
+    typed_input = st.text_input("พิมพ์ชื่อสถานที่ (เช่น: มอกะเสด)", key="location_input")
 
-# --- Voice Input Integration ---
-if st.button("🎙️ พูดคำสั่ง"):
-    voice_text = recognize_speech_from_mic()
-    if voice_text:
-        # อัปเดตข้อความใน text_input ด้วยสิ่งที่พูด
-        st.session_state.location_input = voice_text
-        process_and_search(voice_text)
+    c1, c2 = st.columns(2)
+    if c1.button("🔎 ค้นหาพิกัด", use_container_width=True):
+        process_and_search(typed_input)
+    if c2.button("🎙️ พูดคำสั่ง", use_container_width=True):
+        voice_text = recognize_speech_from_mic()
+        if voice_text:
+            st.session_state.location_input = voice_text
+            process_and_search(voice_text)
 
-st.markdown("---")
-st.subheader("2. ฟังก์ชันเสริมโครงการโดรน")
+    # แสดงผลลัพธ์ตัวเลขคงอยู่ถ้ามีใน state
+    if st.session_state.latitude:
+        st.subheader("ผลการค้นหา")
+        st.code(f"ละติจูด (L): {st.session_state.latitude}\nลองจิจูด (R): {st.session_state.longitude}")
+        st.caption(f"ตำแหน่งที่แม่นยำ: {st.session_state.address}")
 
-# --- Image Upload Integration ---
-uploaded_image = st.file_uploader("📷 อัปโหลดภาพโดรนเพื่อยืนยันภารกิจ", type=["jpg", "jpeg", "png"])
-if uploaded_image:
-    try:
-        st.image(Image.open(uploaded_image), caption="ภาพที่อัปโหลด", use_column_width=True)
-    except Exception as e:
-        st.error(f"ไม่สามารถแสดงภาพที่อัปโหลดได้: {e}")
+    st.subheader("2. ฟังก์ชันเสริมโครงการโดรน")
+    # อัปโหลดภาพ
+    uploaded_image = st.file_uploader("📷 อัปโหลดภาพโดรนเพื่อยืนยันภารกิจ", type=["jpg", "jpeg", "png"])
+    if uploaded_image:
+        try:
+            st.image(Image.open(uploaded_image), caption="ภาพที่อัปโหลด", use_column_width=True)
+        except Exception as e:
+            st.error(f"ไม่สามารถแสดงภาพที่อัปโหลดได้: {e}")
+
+# คอลัมน์ขวา: แผนที่คงอยู่ถ้ามีพิกัดใน state
+with col2:
+    st.subheader("แผนที่")
+    if st.session_state.latitude:
+        m = folium.Map(location=[st.session_state.latitude, st.session_state.longitude], zoom_start=15)
+        folium.Marker(
+            location=[st.session_state.latitude, st.session_state.longitude],
+            popup=f"📍 **{st.session_state.address}** (มาจาก '{st.session_state.user_input}')",
+            tooltip="ตำแหน่งที่ค้นหา"
+        ).add_to(m)
+        try:
+            from streamlit_folium import st_folium
+            st_folium(m, width=700, height=500)
+        except Exception:
+            try:
+                from streamlit_folium import folium_static
+                folium_static(m)
+            except Exception:
+                st.warning("ไม่พบไลบรารี streamlit-folium สำหรับแสดงแผนที่ กรุณาติดตั้งแพ็กเกจนี้")
+    else:
+        st.info("🗺️ แผนที่จะปรากฏที่นี่หลังจากการค้นหาสำเร็จ")
 
 st.info("💡 **การรับเสียง (Voice) และอัปโหลดภาพ** ต้องติดตั้งไลบรารี `SpeechRecognition`, `PyAudio` และ `Pillow`")
