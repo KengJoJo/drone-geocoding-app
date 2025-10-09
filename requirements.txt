@@ -4,6 +4,4 @@ fuzzywuzzy==0.18.0
 rapidfuzz
 folium==0.17.0
 streamlit-folium==0.20.0
-SpeechRecognition==3.10.4
-PyAudio==0.2.14
 Pillow==10.4.0

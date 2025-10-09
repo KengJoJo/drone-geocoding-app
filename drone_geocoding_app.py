@@ -1,13 +1,7 @@
 import streamlit as st
 from geopy.geocoders import ArcGIS
-from fuzzywuzzy import fuzz
+from rapidfuzz import process as rf_process, fuzz as rf_fuzz
 import folium
-try:
-    import speech_recognition as sr
-    SR_AVAILABLE = True
-except ImportError:
-    sr = None
-    SR_AVAILABLE = False
 from PIL import Image
 
 # --- 1. ฐานข้อมูลความรู้ (Knowledge Base) และ Fuzzy Matching Logic ---
@@ -21,19 +15,28 @@ CORRECT_LOCATIONS = [
 ]
 THRESHOLD = 80 # เกณฑ์ตัดสินความถูกต้องของ Fuzzy Matching
 
+def _normalize_text(text):
+    t = (text or "").strip().lower()
+    # ลดเว้นวรรคซ้อนกันให้เหลือช่องว่างเดียว
+    t = " ".join(t.split())
+    return t
+
 def get_best_match(input_name, correct_list, threshold=THRESHOLD):
-    """ใช้ Fuzzy Matching เพื่อหาชื่อสถานที่ที่ถูกต้องที่สุดจาก Knowledge Base"""
-    # [Code block for get_best_match remains the same as previously defined]
-    best_match = None
-    best_score = 0
-    
-    for official_name in correct_list:
-        score = fuzz.ratio(input_name.lower(), official_name.lower())
-        if score > best_score and score >= threshold:
-            best_score = score
-            best_match = official_name
-            
-    return best_match, best_score
+    """ใช้ RapidFuzz เพื่อหาชื่อสถานที่ที่เหมาะสมที่สุดด้วย token_set_ratio"""
+    query = _normalize_text(input_name)
+    if not query:
+        return None, 0
+
+    result = rf_process.extractOne(
+        query,
+        correct_list,
+        scorer=rf_fuzz.token_set_ratio
+    )
+    if not result:
+        return None, 0
+
+    best_name, best_score, _ = result
+    return (best_name, int(best_score)) if best_score >= threshold else (None, int(best_score))
 
 def geocode_and_map(location_to_search, user_input):
     """ฟังก์ชันหลักในการดึงพิกัด สร้างแผนที่ และแสดงผล"""
@@ -85,37 +88,7 @@ def geocode_and_map(location_to_search, user_input):
         st.caption("โปรดลองใช้ชื่อที่เฉพาะเจาะจงมากขึ้น")
 
 
-# --- ฟังก์ชันรับเสียงจากไมโครโฟน ---
-def recognize_speech_from_mic():
-    """รับเสียงจากไมโครโฟนและแปลงเป็นข้อความ (String)"""
-    if not SR_AVAILABLE:
-        st.error("ไม่พบไลบรารี SpeechRecognition กรุณาติดตั้งเพื่อใช้งานฟีเจอร์เสียง")
-        return None
-    recognizer = sr.Recognizer()
-    try:
-        mic = sr.Microphone()
-    except OSError as e:
-        st.error(f"ไมโครโฟนไม่พร้อมใช้งานในสภาพแวดล้อมนี้: {e}")
-        return None
-
-    with mic as source:
-        st.info("🎤 กำลังฟัง... กรุณาพูดชื่อสถานที่")
-        recognizer.adjust_for_ambient_noise(source, duration=0.5)
-        try:
-            audio = recognizer.listen(source, timeout=5, phrase_time_limit=8)
-        except sr.WaitTimeoutError:
-            st.error("รอฟังเสียงนานเกินไป กรุณาลองใหม่")
-            return None
-
-    try:
-        text = recognizer.recognize_google(audio, language="th-TH")
-        st.success(f"📝 ข้อความที่ได้จากเสียง: '{text}'")
-        return text
-    except sr.UnknownValueError:
-        st.error("ไม่สามารถเข้าใจเสียงที่พูด กรุณาลองใหม่")
-    except sr.RequestError as e:
-        st.error(f"เกิดข้อผิดพลาดกับบริการ Google Speech Recognition: {e}")
-    return None
+# (ฟีเจอร์รับเสียงเดิมถูกถอดออกเพื่อรองรับการใช้งานบนคลาวด์)
 
 
 # --- 3. ส่วนแสดงผล Streamlit GUI ---
@@ -178,14 +151,8 @@ with col1:
     st.subheader("1. ป้อนคำสั่ง")
     typed_input = st.text_input("พิมพ์ชื่อสถานที่ (เช่น: มอกะเสด)", key="location_input")
 
-    c1, c2 = st.columns(2)
-    if c1.button("🔎 ค้นหาพิกัด", use_container_width=True):
+    if st.button("🔎 ค้นหาพิกัด", use_container_width=True):
         process_and_search(typed_input)
-    if c2.button("🎙️ พูดคำสั่ง", use_container_width=True):
-        voice_text = recognize_speech_from_mic()
-        if voice_text:
-            st.session_state.location_input = voice_text
-            process_and_search(voice_text)
 
     # แสดงผลลัพธ์ตัวเลขคงอยู่ถ้ามีใน state
     if st.session_state.latitude:
@@ -224,4 +191,4 @@ with col2:
     else:
         st.info("🗺️ แผนที่จะปรากฏที่นี่หลังจากการค้นหาสำเร็จ")
 
-st.info("💡 **การรับเสียง (Voice) และอัปโหลดภาพ** ต้องติดตั้งไลบรารี `SpeechRecognition`, `PyAudio` และ `Pillow`")
+st.info("💡 ฟังก์ชันอัปโหลดภาพต้องติดตั้งไลบรารี `Pillow`")
