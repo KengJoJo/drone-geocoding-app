@@ -9,6 +9,7 @@ import wave
 import numpy as np
 from openai import OpenAI
 from streamlit_webrtc import webrtc_streamer, WebRtcMode
+import streamlit.components.v1 as components
 
 # --- Voice via Browser (WebRTC + Whisper API) ---
 def record_and_transcribe_with_whisper() -> str | None:
@@ -182,6 +183,24 @@ if 'latitude' not in st.session_state:
     st.session_state['address'] = None
     st.session_state['user_input'] = None
 
+# ตรวจจับข้อความจากพารามิเตอร์ใน URL (จากคอมโพเนนต์เสียงฝั่งเบราว์เซอร์)
+try:
+    qp = st.query_params  # Streamlit >= 1.27
+except Exception:
+    qp = {}
+voice_q = qp.get('voice') if isinstance(qp, dict) else None
+if isinstance(voice_q, list):
+    voice_q = voice_q[0] if voice_q else None
+if voice_q:
+    st.session_state.location_input = voice_q
+    process_text = voice_q
+    # ล้างพารามิเตอร์เพื่อไม่ให้วนซ้ำ
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+    # จะเรียกค้นหาหลังจาก UI ส่วนอินพุตถูกเรนเดอร์แล้วด้านล่าง
+
 # ฟังก์ชัน Geocoding ที่จะบันทึกผลลัพธ์ลง session_state
 def geocode_location(location_to_search, user_input):
     clean_query = (location_to_search or "").strip()
@@ -236,18 +255,44 @@ with col1:
 
     if st.button("🔎 ค้นหาพิกัด", use_container_width=True):
         process_and_search(typed_input)
-    # ปุ่มพูดคำสั่ง (เว็บ) ใช้เบราว์เซอร์ + Whisper API
-    if st.button("🎙️ พูดคำสั่ง (เว็บ)", use_container_width=True):
-        spoken = record_and_transcribe_with_whisper()
-        if spoken:
-            st.session_state.location_input = spoken
-            process_and_search(spoken)
+    # ปุ่มพูดคำสั่ง (เบราว์เซอร์ ไม่ใช้ API key)
+    if st.button("🎙️ พูดคำสั่ง (เบราว์เซอร์)", use_container_width=True):
+        # ฝัง Web Speech API แบบง่าย: เปิดแท็บใหม่ถอดเสียงแล้วรีไดเร็กต์กลับมาพร้อมพารามิเตอร์
+        html = """
+        <script>
+          async function startRecognition() {
+            if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+              alert('เบราว์เซอร์ของคุณไม่รองรับ Web Speech API');
+              return;
+            }
+            const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
+            const rec = new Rec();
+            rec.lang = 'th-TH';
+            rec.interimResults = false;
+            rec.maxAlternatives = 1;
+            rec.onresult = (e) => {
+              const text = e.results[0][0].transcript;
+              const url = new URL(window.location.href);
+              url.searchParams.set('voice', text);
+              window.location.href = url.toString();
+            };
+            rec.onerror = (e) => alert('เกิดข้อผิดพลาดการจดจำเสียง: ' + e.error);
+            rec.start();
+          }
+          startRecognition();
+        </script>
+        """
+        components.html(html, height=0, width=0)
 
     # แสดงผลลัพธ์ตัวเลขคงอยู่ถ้ามีใน state
     if st.session_state.latitude:
         st.subheader("ผลการค้นหา")
         st.code(f"ละติจูด (L): {st.session_state.latitude}\nลองจิจูด (R): {st.session_state.longitude}")
         st.caption(f"ตำแหน่งที่แม่นยำ: {st.session_state.address}")
+    # หากมีข้อความจากพารามิเตอร์เสียง ให้ประมวลผลทันทีครั้งเดียว
+    if 'process_text' in locals() and process_text:
+        process_and_search(process_text)
+        process_text = None
 
     st.subheader("2. ฟังก์ชันเสริมโครงการโดรน")
     # อัปโหลดภาพ
