@@ -18,6 +18,9 @@ def handle_voice_query_once():
             st.query_params.clear()
         except Exception:
             pass
+    # ถ้าไม่เจอ voice query ให้รีเซ็ตธง เพื่อให้ครั้งต่อไปทำงานได้
+    elif not voice_q:
+        st.session_state['_voice_processed'] = False
 
 import streamlit as st
 from geopy.geocoders import ArcGIS, Nominatim
