@@ -6,6 +6,5 @@ libavutil-dev
 libavfilter-dev
 libswscale-dev
 libswresample-dev
-libavresample-dev
 pkg-config
 build-essential
