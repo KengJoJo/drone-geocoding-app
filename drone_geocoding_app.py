@@ -163,6 +163,7 @@ if 'latitude' not in st.session_state:
     st.session_state['longitude'] = None
     st.session_state['address'] = None
     st.session_state['user_input'] = None
+    st.session_state['location_input'] = ""
 
 # ฟังก์ชัน Geocoding ที่จะบันทึกผลลัพธ์ลง session_state
 def geocode_location(location_to_search, user_input):
