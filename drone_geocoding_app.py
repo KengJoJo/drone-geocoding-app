@@ -1,33 +1,63 @@
-# ตรวจจับข้อความจากพารามิเตอร์ใน URL (จากคอมโพเนนต์เสียงฝั่งเบราว์เซอร์)
-def handle_voice_query_once():
-    try:
-        qp = st.query_params  # Streamlit >= 1.27
-    except Exception:
-        qp = {}
-    voice_q = qp.get('voice') if isinstance(qp, dict) else None
-    if isinstance(voice_q, list):
-        voice_q = voice_q[0] if voice_q else None
-
-    # ป้องกันรันซ้ำหลังรีเฟรชด้วย state flag
-    if voice_q and not st.session_state.get('_voice_processed'):
-        st.session_state['_voice_processed'] = True
-        st.session_state.location_input = voice_q
-        process_and_search(voice_q)
-        # ล้างพารามิเตอร์เพื่อไม่ให้วนซ้ำ
-        try:
-            st.query_params.clear()
-        except Exception:
-            pass
-
 import streamlit as st
 from geopy.geocoders import ArcGIS, Nominatim
 from rapidfuzz import process as rf_process, fuzz as rf_fuzz
 import folium
 from PIL import Image
 import os
-import streamlit.components.v1 as components
+import io
+from faster_whisper import WhisperModel
+import tempfile
 
-# (โหมด Whisper/WebRTC ถูกถอดออก — ใช้ Web Speech API ในเบราว์เซอร์แทน)
+# --- Audio Transcription with Faster-Whisper ---
+@st.cache_resource
+def load_whisper_model():
+    """Load the faster-whisper model once and cache it"""
+    st.info("🧠 กำลังโหลดโมเดล Whisper...")
+    try:
+        # Try medium model first (faster), fallback to large-v3 (more accurate)
+        model = WhisperModel("medium", device="cpu", compute_type="int8")
+        st.success("✅ โมเดล Whisper โหลดสำเร็จ")
+        return model
+    except Exception as e:
+        st.warning(f"⚠️ ไม่สามารถโหลดโมเดล medium ได้: {e}")
+        try:
+            model = WhisperModel("large-v3", device="cpu", compute_type="int8")
+            st.success("✅ โมเดล Whisper large-v3 โหลดสำเร็จ")
+            return model
+        except Exception as e2:
+            st.error(f"❌ ไม่สามารถโหลดโมเดล Whisper ได้: {e2}")
+            return None
+
+def transcribe_audio(audio_bytes, model):
+    """Transcribe audio bytes using faster-whisper"""
+    if not model:
+        return ""
+    
+    try:
+        # Save audio bytes to temporary file
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+            tmp_file.write(audio_bytes)
+            tmp_file_path = tmp_file.name
+        
+        # Transcribe with faster-whisper
+        segments, info = model.transcribe(
+            tmp_file_path, 
+            language="th",
+            beam_size=5,
+            best_of=5,
+            temperature=0.0
+        )
+        
+        # Clean up temporary file
+        os.unlink(tmp_file_path)
+        
+        # Combine all segments
+        text = " ".join(segment.text for segment in segments).strip()
+        return text
+        
+    except Exception as e:
+        st.error(f"❌ เกิดข้อผิดพลาดในการถอดเสียง: {e}")
+        return ""
 
 # --- 1. ฐานข้อมูลความรู้ (Knowledge Base) และ Fuzzy Matching Logic ---
 
@@ -175,8 +205,7 @@ def process_and_search(user_input):
     if matched_name:
         st.success(f"🤖 AI แก้ไขคำผิดสำเร็จ: '{user_input}' ถูกเปลี่ยนเป็น '{matched_name}' (คะแนน: {score}%)")
     else:
-        st.warning("⚠️ ไม่พบคำใกล้เคียงในฐานข้อมูล. ค้นหาด้วยคำที่ป้อนโดยตรง.")
-    geocode_location(location_to_search, user_input)
+        geocode_location(location_to_search, user_input)
 
 
 col1, col2 = st.columns([1, 1])
@@ -186,39 +215,33 @@ with col1:
     st.subheader("1. ป้อนคำสั่ง")
     typed_input = st.text_input("พิมพ์ชื่อสถานที่ (เช่น: มอกะเสด)", key="location_input")
 
-    # จัดการพารามิเตอร์ voice ก่อนเพื่อให้ค้นหาทันทีหลัง reload
-    handle_voice_query_once()
-
     if st.button("🔎 ค้นหาพิกัด", use_container_width=True):
         process_and_search(typed_input)
-    # ปุ่มพูดคำสั่ง (เบราว์เซอร์ ไม่ใช้ API key)
-    if st.button("🎙️ พูดคำสั่ง (เบราว์เซอร์)", use_container_width=True):
-        # ฝัง Web Speech API แบบง่าย: เปิดแท็บใหม่ถอดเสียงแล้วรีไดเร็กต์กลับมาพร้อมพารามิเตอร์
-        html = """
-        <script>
-          async function startRecognition() {
-            if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-              alert('เบราว์เซอร์ของคุณไม่รองรับ Web Speech API');
-              return;
-            }
-            const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
-            const rec = new Rec();
-            rec.lang = 'th-TH';
-            rec.interimResults = false;
-            rec.maxAlternatives = 1;
-            rec.onresult = (e) => {
-              const text = e.results[0][0].transcript;
-              const url = new URL(window.location.href);
-              url.searchParams.set('voice', text);
-              window.location.href = url.toString();
-            };
-            rec.onerror = (e) => alert('เกิดข้อผิดพลาดการจดจำเสียง: ' + e.error);
-            rec.start();
-          }
-          startRecognition();
-        </script>
-        """
-        components.html(html, height=0, width=0)
+    
+    # Audio file upload for transcription
+    st.markdown("**อัปโหลดไฟล์เสียง**")
+    uploaded_audio = st.file_uploader(
+        "🎵 อัปโหลดไฟล์เสียงเพื่อถอดข้อความ", 
+        type=["wav", "mp3", "m4a", "flac", "ogg"],
+        help="รองรับไฟล์เสียงภาษาไทย (WAV, MP3, M4A, FLAC, OGG)"
+    )
+    
+    if uploaded_audio:
+        # Load whisper model (cached)
+        model = load_whisper_model()
+        
+        if model:
+            with st.spinner("🔍 กำลังถอดเสียง..."):
+                audio_bytes = uploaded_audio.read()
+                transcribed_text = transcribe_audio(audio_bytes, model)
+            
+            if transcribed_text:
+                st.success(f"📝 ข้อความที่ถอดได้: '{transcribed_text}'")
+                # Automatically trigger search
+                st.session_state.location_input = transcribed_text
+                process_and_search(transcribed_text)
+            else:
+                st.warning("⚠️ ไม่สามารถถอดข้อความจากไฟล์เสียงได้")
 
     # แสดงผลลัพธ์ตัวเลขคงอยู่ถ้ามีใน state
     if st.session_state.latitude:
