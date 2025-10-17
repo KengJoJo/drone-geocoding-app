@@ -7,9 +7,18 @@ import os
 import tempfile
 import re
 from faster_whisper import WhisperModel
-from audio_recorder_streamlit import audio_recorder
-import pythainlp
-from pythainlp.tokenize import word_tokenize
+try:
+    from audio_recorder_streamlit import audio_recorder
+    AUDIO_RECORDER_AVAILABLE = True
+except ImportError:
+    AUDIO_RECORDER_AVAILABLE = False
+
+try:
+    import pythainlp
+    from pythainlp.tokenize import word_tokenize
+    PYTHAINLP_AVAILABLE = True
+except ImportError:
+    PYTHAINLP_AVAILABLE = False
 # streamlit_folium อาจจะต้อง import ไว้ข้างบนถ้ามีการใช้งานบ่อย
 try:
     from streamlit_folium import st_folium
@@ -241,18 +250,19 @@ def extract_location_from_text(text):
             if len(cleaned) > 3:  # กรองคำที่สั้นเกินไป
                 potential_locations.append(cleaned)
     
-    # 3. ใช้ pythainlp tokenize เพื่อหาคำนามเฉพาะ
-    try:
-        words = word_tokenize(text, engine='newmm')
-        # หาคำที่เป็นคำนามโดยดูจากคำเชื่อมโดยรอบ
-        for i, word in enumerate(words):
-            # หา compound words เช่น "มหาวิทยาลัย" + คำถัดไป
-            if word in ['มหาวิทยาลัย', 'สนามบิน', 'วัด', 'โรงพยาบาล', 'อนุสาวรีย์'] and i + 1 < len(words):
-                compound = word + words[i + 1]
-                if len(compound) > 5:
-                    potential_locations.append(compound)
-    except:
-        pass  # ถ้า tokenizer ล้มเหลวก็ข้ามไป
+    # 3. ใช้ pythainlp tokenize เพื่อหาคำนามเฉพาะ (ถ้ามี)
+    if PYTHAINLP_AVAILABLE:
+        try:
+            words = word_tokenize(text, engine='newmm')
+            # หาคำที่เป็นคำนามโดยดูจากคำเชื่อมโดยรอบ
+            for i, word in enumerate(words):
+                # หา compound words เช่น "มหาวิทยาลัย" + คำถัดไป
+                if word in ['มหาวิทยาลัย', 'สนามบิน', 'วัด', 'โรงพยาบาล', 'อนุสาวรีย์'] and i + 1 < len(words):
+                    compound = word + words[i + 1]
+                    if len(compound) > 5:
+                        potential_locations.append(compound)
+        except:
+            pass  # ถ้า tokenizer ล้มเหลวก็ข้ามไป
     
     # ลบคำซ้ำ และ return แค่ unique values
     return list(set(potential_locations))
@@ -379,34 +389,35 @@ with col1:
     
     st.markdown("**หรือ** บันทึก/อัปโหลดไฟล์เสียง")
     
-    # บันทึกเสียงแบบ real-time
-    st.markdown("🎙️ **บันทึกเสียงแบบ real-time**")
-    audio_bytes = audio_recorder(
-        text="กดเพื่อบันทึก",
-        recording_color="#e74c3c",
-        neutral_color="#34495e",
-        icon_name="microphone",
-        icon_size="2x",
-        pause_threshold=2.0,  # หยุดอัตโนมัติหลัง 2 วินาที
-        sample_rate=16000     # ความถี่เสียงที่เหมาะสำหรับ Whisper
-    )
-    
-    if audio_bytes:
-        st.success("✅ บันทึกเสียงสำเร็จ! กำลังถอดเสียง...")
-        model = load_whisper_model()
-        if model:
-            with st.spinner("🔍 กำลังถอดเสียง..."):
-                transcribed_text = transcribe_audio(audio_bytes, model)
+    # บันทึกเสียงแบบ real-time (ถ้ามี library)
+    if AUDIO_RECORDER_AVAILABLE:
+        st.markdown("🎙️ **บันทึกเสียงแบบ real-time**")
+        audio_bytes = audio_recorder(
+            text="กดเพื่อบันทึก",
+            recording_color="#e74c3c",
+            neutral_color="#34495e",
+            icon_name="microphone",
+            icon_size="2x",
+            pause_threshold=2.0,
+            sample_rate=16000
+        )
+        
+        if audio_bytes:
+            st.success("✅ บันทึกเสียงสำเร็จ! กำลังถอดเสียง...")
+            model = load_whisper_model()
+            if model:
+                with st.spinner("🔍 กำลังถอดเสียง..."):
+                    transcribed_text = transcribe_audio(audio_bytes, model)
 
-            if transcribed_text:
-                st.success(f"📝 ข้อความที่ถอดได้: **{transcribed_text}**")
-                # ใส่ข้อความลงใน text input โดยอัตโนมัติ
-                st.session_state.location_input = transcribed_text
-                # ค้นหาสถานที่ทันที
-                process_and_search(transcribed_text)
-                st.rerun()  # refresh เพื่อให้ UI อัปเดต
-            else:
-                st.warning("⚠️ ไม่สามารถถอดข้อความจากเสียงที่บันทึกได้")
+                if transcribed_text:
+                    st.success(f"📝 ข้อความที่ถอดได้: **{transcribed_text}**")
+                    st.session_state.location_input = transcribed_text
+                    process_and_search(transcribed_text)
+                    st.rerun()
+                else:
+                    st.warning("⚠️ ไม่สามารถถอดข้อความจากเสียงที่บันทึกได้")
+    else:
+        st.info("📝 **หมายเหตุ:** ฟีเจอร์บันทึกเสียงไม่พร้อมใช้งานบน Cloud - ใช้การอัปโหลดไฟล์แทน")
     
     st.markdown("**หรือ** อัปโหลดไฟล์เสียง")
     st.file_uploader(
