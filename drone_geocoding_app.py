@@ -7,11 +7,6 @@ import os
 import tempfile
 import re
 from faster_whisper import WhisperModel
-try:
-    from audio_recorder_streamlit import audio_recorder
-    AUDIO_RECORDER_AVAILABLE = True
-except ImportError:
-    AUDIO_RECORDER_AVAILABLE = False
 
 try:
     import pythainlp
@@ -24,6 +19,13 @@ try:
     from streamlit_folium import st_folium
 except ImportError:
     st_folium = None
+
+# Audio recorder - import แยกเพื่อ cloud compatibility
+try:
+    from audio_recorder_streamlit import audio_recorder
+    AUDIO_RECORDER_AVAILABLE = True
+except ImportError:
+    AUDIO_RECORDER_AVAILABLE = False
 
 # --- Audio Transcription with Faster-Whisper (Optimized for Thai) ---
 @st.cache_resource
