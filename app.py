@@ -3,474 +3,362 @@ from geopy.geocoders import ArcGIS, Nominatim
 from rapidfuzz import process as rf_process, fuzz as rf_fuzz
 import folium
 from PIL import Image
-import os
-import tempfile
-import re
-from faster_whisper import WhisperModel
+import os, re, io, tempfile, textwrap
+from datetime import datetime
 
-# streamlit_folium อาจจะต้อง import ไว้ข้างบนถ้ามีการใช้งานบ่อย
+# ⬇️ ใช้ OpenAI-compatible client (Typhoon): ตั้งค่า ENV -> OPENTYPHOON_BASE_URL, OPENTYPHOON_API_KEY, TYPHOON_MODEL
+#    จะ fallback ไปอ่านจาก module api_transcribe.py ถ้ามี (เพื่อความสะดวกในการ dev)
+from openai import OpenAI
+
+# optional (ไม่บังคับ)
 try:
     from streamlit_folium import st_folium
-except ImportError:
+except Exception:
     st_folium = None
 
 try:
     import pythainlp
     from pythainlp.tokenize import word_tokenize
     PYTHAINLP_AVAILABLE = True
-except ImportError:
+except Exception:
     PYTHAINLP_AVAILABLE = False
 
-# Audio recorder - import แยกเพื่อ cloud compatibility
-AUDIO_RECORDER_AVAILABLE = False
-audio_recorder = None
-try:
-    from audio_recorder_streamlit import audio_recorder
-    AUDIO_RECORDER_AVAILABLE = True
-except ImportError:
-    pass
+# ====== CONFIG ======
+APP_TITLE = "🗺️ Fuzzy Geocoding + Typhoon ASR"
+DEFAULT_MODEL = os.getenv("TYPHOON_MODEL", "typhoon-asr-realtime")
+DEFAULT_BASE  = os.getenv("OPENTYPHOON_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "https://api.opentyphoon.ai/v1"
+API_KEY       = os.getenv("OPENTYPHOON_API_KEY") or os.getenv("OPENAI_API_KEY")
 
-# --- Audio Transcription with Faster-Whisper (Optimized for Thai) ---
-@st.cache_resource
-def load_whisper_model():
-    """โหลด faster-whisper model ที่ปรับแต่งสำหรับภาษาไทย"""
-    st.info("🧠 กำลังโหลดโมเดล Whisper ที่ปรับแต่งสำหรับภาษาไทย...")
-    
-    # ลำดับ priority: large-v3 -> large-v2 -> medium -> base
-    models_to_try = [
-        ("large-v3", "float16"),  # แม่นยำที่สุด
-        ("large-v2", "float16"),  # รองลงมา
-        ("medium", "int8"),       # เร็วและแม่นยำพอสมควร
-        ("base", "int8")         # fallback
-    ]
-    
-    for model_name, compute_type in models_to_try:
+# ========= UTIL: API client loader =========
+def make_client():
+    key = API_KEY
+    base = DEFAULT_BASE
+    model = DEFAULT_MODEL
+
+    # fallback ไปอ่านจาก api_transcribe.py ถ้ากำหนด ENV ไม่ครบ
+    if (not key) or (not base) or (not model):
         try:
-            st.info(f"🔄 กำลังลองโมเดล {model_name}...")
-            model = WhisperModel(model_name, device="cpu", compute_type=compute_type)
-            st.success(f"✅ โมเดล Whisper {model_name} โหลดสำเร็จ!")
-            return model
-        except Exception as e:
-            st.warning(f"⚠️ โมเดล {model_name} ล้มเหลว: {e}")
-            continue
-    
-    st.error("❌ ไม่สามารถโหลดโมเดล Whisper ได้เลย")
-    return None
+            import api_transcribe as at
+            key = key or getattr(at, "API_KEY", None)
+            base = base or getattr(at, "BASE_URL", None)
+            model = model or getattr(at, "MODEL", None)
+        except Exception:
+            pass
 
-def transcribe_audio(audio_bytes, model):
-    """ถอดเสียง audio bytes โดยใช้ faster-whisper แบบปรับแต่งสำหรับภาษาไทย"""
-    if not model:
-        return ""
-    
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-            tmp_file.write(audio_bytes)
-            tmp_file_path = tmp_file.name
-        
-        # ปรับ parameters เพื่อความแม่นยำสูงสุด
-        segments, info = model.transcribe(
-            tmp_file_path,
-            language="th",              # บังคับภาษาไทย
-            beam_size=10,               # เพิ่มจาก 5 เป็น 10 เพื่อความแม่นยำ
-            best_of=10,                 # เพิ่มจาก 5 เป็น 10
-            temperature=0.0,            # ความมั่นใจสูงสุด
-            patience=2,                 # เพิ่ม patience เพื่อการค้นหาที่ดีขึ้น
-            length_penalty=1.0,         # ควบคุมความยาวของประโยค
-            repetition_penalty=1.1,     # ลดการพูดซ้ำ
-            no_repeat_ngram_size=2,     # ป้องกันคำซ้ำในระยะสั้น
-            suppress_blank=True,        # ลบช่วงว่าง
-            suppress_tokens=[-1],       # ลบ tokens ที่ไม่ต้องการ
-            without_timestamps=False,   # เก็บ timestamp ไว้เพื่อ debug
-            word_timestamps=True        # เพิ่ม word-level timestamps
+    if not key:
+        raise RuntimeError(
+            "ไม่พบ API key. ตั้ง ENV: OPENTYPHOON_API_KEY (หรือ OPENAI_API_KEY) และ OPENTYPHOON_BASE_URL"
         )
-        
-        os.unlink(tmp_file_path)
-        
-        # รวมข้อความและทำความสะอาด
-        text = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
-        
-        # ปรับแต่งข้อความเพิ่มเติม
-        text = clean_thai_text(text)
-        
-        return text
-        
-    except Exception as e:
-        st.error(f"❌ เกิดข้อผิดพลาดในการถอดเสียง: {e}")
-        return ""
+    return OpenAI(api_key=key, base_url=base), model
 
-def clean_thai_text(text):
-    """ทำความสะอาดข้อความภาษาไทยที่ได้จาก Whisper"""
+# ========= ASR via Typhoon =========
+def typhoon_transcribe(audio_bytes: bytes, file_ext: str = ".wav") -> str:
+    """
+    ส่งไฟล์เสียงไป Typhoon ASR (OpenAI-compatible /audio/transcriptions)
+    รองรับไฟล์ที่มาจาก audio_recorder_streamlit และ file_uploader
+    """
+    client, model = make_client()
+
+    # เขียนลง temp ชั่วคราวเพราะ client ต้องการไฟล์-like object
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+
+    try:
+        with open(tmp_path, "rb") as f:
+            resp = client.audio.transcriptions.create(model=model, file=f)
+        text = getattr(resp, "text", None) or (getattr(resp, "to_dict", lambda: {})().get("text") if hasattr(resp, "to_dict") else None)
+        return postprocess_text((text or "").strip())
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+# ========= Thai text postprocess (สั้น กระชับ) =========
+# ปรับเว้นวรรคเลข/หน่วย + ล้าง whitespace ผิดปกติ
+_UNIT_WORDS = r'(เมตร|ม\.|กิโลเมตร|กม\.|เซนติเมตร|ซม\.|มิลลิเมตร|มม\.|วินาที|นาที|ชั่วโมง|องศา|%)'
+def postprocess_text(text: str) -> str:
     if not text:
         return ""
-    
-    # ลบช่วงว่างหลายช่วงและ normalize spaces
-    text = re.sub(r'\s+', ' ', text).strip()
-    
-    # ลบอักขระพิเศษและสัญลักษณ์ที่ไม่จำเป็น
-    text = re.sub(r'[^\u0e00-\u0e7f\w\s]', '', text)
-    
-    # แก้ไขคำที่ Whisper มักจะถอดผิด
-    common_fixes = {
-        'มหาวิทยาลัย': 'มหาวิทยาลัย',
-        'เทคโนโลยี': 'เทคโนโลยี',
-        'พระจอมเกล้า': 'พระจอมเกล้า',
-        'สุวรรณภูมิ': 'สุวรณภูมิ',
-        'กรุงเทพมหานคร': 'กรุงเทพมหานคร',
-        'ชัยสมรภูมิ': 'ชัยสมรภูมิ'
-    }
-    
-    # แทนที่คำที่ถอดผิด
-    for wrong, correct in common_fixes.items():
-        text = text.replace(wrong, correct)
-    
-    return text.strip()
+    x = re.sub(r'\s+', ' ', text).strip()
+    x = re.sub(r'(\d)\s*' + _UNIT_WORDS, r'\1 \2', x)
+    x = re.sub(r'(?<=[ก-๛A-Za-z])(?=\d)', ' ', x)
+    x = re.sub(r'(?<=\d)(?=[ก-๛A-Za-z])', ' ', x)
+    # แก้คำที่เคยสะกดผิดในตัวอย่างเดิม (เช่น สุวรรณภูมิ)
+    x = x.replace("สุวรณภูมิ","สุวรรณภูมิ")
+    return x
 
-# ----> ฟังก์ชัน Callback ที่สร้างขึ้นมาใหม่ <----
-def handle_audio_upload():
-    if 'audio_uploader' in st.session_state and st.session_state.audio_uploader is not None:
-        model = load_whisper_model()
-        if model:
-            with st.spinner("🔍 กำลังถอดเสียง..."):
-                audio_bytes = st.session_state.audio_uploader.read()
-                transcribed_text = transcribe_audio(audio_bytes, model)
-
-            if transcribed_text:
-                st.success(f"📝 ข้อความที่ถอดได้: '{transcribed_text}'")
-                # อัปเดตค่าใน session_state เพื่อให้ text_input รับไปใช้ในรอบถัดไป
-                st.session_state.location_input = transcribed_text
-                # รีเฟรชหน้าเพื่อให้ widget รับค่าใหม่
-                st.rerun()
-            else:
-                st.warning("⚠️ ไม่สามารถถอดข้อความจากไฟล์เสียงได้")
-
-# --- 1. ฐานข้อมูลความรู้ (Knowledge Base) และ Fuzzy Matching Logic ---
-CORRECT_LOCATIONS = [
-    # มหาวิทยาลัย
+# ========= Place list handling =========
+BUILTIN_LOCATIONS = [
+    # — ใส่ชุดจำเป็นให้พอเริ่ม — สามารถเสริมจากไฟล์ได้ข้างล่าง —
     "มหาวิทยาลัยเทคโนโลยีพระจอมเกล้าพระนครเหนือ",
     "มหาวิทยาลัยเกษตรศาสตร์",
     "มหาวิทยาลัยกรุงเทพ",
-    "มหาวิทยาลัยชุลาลงกรณ์",
+    "จุฬาลงกรณ์มหาวิทยาลัย",
     "มหาวิทยาลัยมหิดล",
     "มหาวิทยาลัยธรรมศาสตร์",
     "มหาวิทยาลัยรามคำแหง",
     "มหาวิทยาลัยศรีนครินทรวิโรฒ",
-    "มอกะ", "เกษตร", "กทม",  # ชื่อเล่น
-    
-    # สนามบิน
     "ท่าอากาศยานสุวรรณภูมิ",
     "ท่าอากาศยานดอนเมือง",
     "สนามบินสุวรรณภูมิ",
     "สนามบินดอนเมือง",
-    
-    # สถานที่สำคัญ
     "อนุสาวรีย์ชัยสมรภูมิ",
-    "อนุสาวรีย์ประชาธิปไตย",
     "วัดพระแก้ว",
-    "วัดพอ",
     "วัดอรุณ",
-    "วัดเบญจมบพิตร",
-    "วัดพระศรีรัตนศาสดาราม",
-    "วัดไตรมิตร",
     "พระบรมมหาราชวัง",
-    
-    # สถานีการเดินทาง
-    "สถานีรถไฟฟ้าหัวลำโพง",
-    "สถานี BTS สยาม",
-    "สถานี MRT สุขุมวิท",
-    "สถานีรถไฟฟ้ากรุงเทพ",
-    "สถานีรถไฟฟ้าจตุจักร",
-    "สถานีรถไฟฟ้าพอพระราม สี่",
-    "สถานีรถไฟฟ้าพระน่องเกล้า",
-    
-    # สถานที่ราชการ
-    "พระบรมมหาราชวัง",
-    "พระราชวังบรรเจทพระบาทสมเด็จพระปกเกล้าฯ",
-    "ทำเนียบรัฐสภา",
-    "สำนักนายกรัฐมนตรี",
-    "กระทรวงการต่างประเทศ",
-    "กระทรวงกรุงเทพมหานคร",
-    
-    # ศูนย์การค้า
-    "พารากอน สยาม พารากอน",
-    "เซ็นทรัล เวิลด์",
-    "เอ็มบีเค",
-    "ไอคอน สยาม",
-    "เทอร์มินอล 21",
-    "มาบูญครอง สยาม",
-    "แพลตินัม แฟชั่น มอลล์",
-    
-    # โรงพยาบาล
-    "โรงพยาบาลจุฬาลงกรณ์",
-    "โรงพยาบาลศิริราช",
-    "โรงพยาบาลรามาธิบดี",
-    "โรงพยาบาลเวชศาสตร์",
-    
-    # สถานที่ท่องเที่ยว
-    "จังหวัดภูเก็ต",
-    "จังหวัดเชียงใหม่",
-    "จังหวัดขอนแก่น",
-    "จังหวัดสงขลา",
-    "จังหวัดสุราษฎร์ธานี",
-    "พัทยา", "เชียงใหม่", "ภูเก็ต"  # ชื่อสั้น
+    "พารากอน", "สยามพารากอน", "เซ็นทรัลเวิลด์",
+    "โรงพยาบาลจุฬาลงกรณ์", "โรงพยาบาลศิริราช", "โรงพยาบาลรามาธิบดี",
+    "จังหวัดภูเก็ต", "จังหวัดเชียงใหม่", "จังหวัดขอนแก่น", "จังหวัดสงขลา", "จังหวัดสุราษฎร์ธานี",
+    "เชียงใหม่", "ภูเก็ต", "พัทยา",
 ]
-THRESHOLD = 70  # ลดจาก 80 เป็น 70 เพื่อให้ยืดหยุ่นขึ้น
+THRESHOLD = 70
 
-def _normalize_text(text):
-    t = (text or "").strip().lower()
-    t = " ".join(t.split())
-    return t
+def load_places_from_txt(filename="th_places.txt"):
+    # ถ้ามีไฟล์ text (หนึ่งชื่อ/หนึ่งบรรทัด) จะโหลดรวมกับ BUILTIN
+    # คุณสามารถอัปโหลดไฟล์นี้ขึ้นไปในหน้า Deploy ของ Streamlit ได้เลย
+    try:
+        if os.path.exists(filename):
+            with open(filename, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f if l.strip()]
+            return list(dict.fromkeys(BUILTIN_LOCATIONS + lines))
+    except Exception:
+        pass
+    return BUILTIN_LOCATIONS
 
-def extract_location_from_text(text):
-    """ดึงชื่อสถานที่จากประโยคยาวๆ โดยใช้ pattern matching"""
+ALL_PLACES = load_places_from_txt()
+
+def _normalize_text(t: str) -> str:
+    t = (t or "").strip().lower()
+    return " ".join(t.split())
+
+def extract_location_from_text(text: str):
     if not text:
         return []
-    
-    text = _normalize_text(text)
-    potential_locations = []
-    
-    # 1. หาคำที่ตรงกับลิสต์โดยตรง
-    for location in CORRECT_LOCATIONS:
-        location_normalized = _normalize_text(location)
-        if location_normalized in text:
-            potential_locations.append(location)
-    
-    # 2. ใช้ Regex patterns หาคำที่เป็นสถานที่
-    location_patterns = [
-        r'(มหาวิทยาลัย[\u0e00-\u0e7f\s]+)',  # มหาวิทยาลัย + ชื่อ
-        r'(ท่าอากาศยาน[\u0e00-\u0e7f\s]+)',      # สนามบิน
-        r'(สนามบิน[\u0e00-\u0e7f\s]+)',            # สนามบิน
-        r'(อนุสาวรีย์[\u0e00-\u0e7f\s]+)',        # อนุสาวรีย์
-        r'(วัด[\u0e00-\u0e7f\s]+)',                   # วัด
-        r'(โรงพยาบาล[\u0e00-\u0e7f\s]+)',        # โรงพยาบาล
-        r'(จังหวัด[\u0e00-\u0e7f\s]+)',            # จังหวัด
-        r'(สถานี[\u0e00-\u0e7f\s]+)',               # สถานี
-        r'(BTS [\u0e00-\u0e7f\w\s]+)',                # BTS
-        r'(MRT [\u0e00-\u0e7f\w\s]+)',                # MRT
+    text_norm = _normalize_text(text)
+    out = []
+
+    # 1) ตรงตัวจากลิสต์
+    for loc in ALL_PLACES:
+        if _normalize_text(loc) in text_norm:
+            out.append(loc)
+
+    # 2) regex pattern ทั่วไป
+    pats = [
+        r'(มหาวิทยาลัย[\u0e00-\u0e7f\s]+)',
+        r'(ท่าอากาศยาน[\u0e00-\u0e7f\s]+)',
+        r'(สนามบิน[\u0e00-\u0e7f\s]+)',
+        r'(อนุสาวรีย์[\u0e00-\u0e7f\s]+)',
+        r'(วัด[\u0e00-\u0e7f\s]+)',
+        r'(โรงพยาบาล[\u0e00-\u0e7f\s]+)',
+        r'(จังหวัด[\u0e00-\u0e7f\s]+)',
+        r'(สถานี[\u0e00-\u0e7f\s]+)',
+        r'(BTS [\u0e00-\u0e7f\w\s]+)',
+        r'(MRT [\u0e00-\u0e7f\w\s]+)',
     ]
-    
-    for pattern in location_patterns:
-        matches = re.findall(pattern, text, re.UNICODE)
-        for match in matches:
-            cleaned = match.strip()
-            if len(cleaned) > 3:  # กรองคำที่สั้นเกินไป
-                potential_locations.append(cleaned)
-    
-    # 3. ใช้ pythainlp tokenize เพื่อหาคำนามเฉพาะ (ถ้ามี)
+    for p in pats:
+        for m in re.findall(p, text_norm, re.UNICODE):
+            m = m.strip()
+            if len(m) > 3:
+                out.append(m)
+
+    # 3) pythainlp (optional)
     if PYTHAINLP_AVAILABLE:
         try:
-            words = word_tokenize(text, engine='newmm')
-            # หาคำที่เป็นคำนามโดยดูจากคำเชื่อมโดยรอบ
-            for i, word in enumerate(words):
-                # หา compound words เช่น "มหาวิทยาลัย" + คำถัดไป
-                if word in ['มหาวิทยาลัย', 'สนามบิน', 'วัด', 'โรงพยาบาล', 'อนุสาวรีย์'] and i + 1 < len(words):
-                    compound = word + words[i + 1]
-                    if len(compound) > 5:
-                        potential_locations.append(compound)
-        except:
-            pass  # ถ้า tokenizer ล้มเหลวก็ข้ามไป
-    
-    # ลบคำซ้ำ และ return แค่ unique values
-    return list(set(potential_locations))
+            words = word_tokenize(text_norm, engine="newmm")
+            for i, w in enumerate(words):
+                if w in ['มหาวิทยาลัย','สนามบิน','วัด','โรงพยาบาล','อนุสาวรีย์'] and i+1 < len(words):
+                    cand = (w + words[i+1]).strip()
+                    if len(cand) > 4:
+                        out.append(cand)
+        except Exception:
+            pass
+    return list(dict.fromkeys(out))
 
-def get_best_match(input_name, correct_list, threshold=THRESHOLD):
-    """หา fuzzy match ที่ดีที่สุด - รองรับการค้นหาจากประโยคด้วย"""
-    # 1. ลองดึงสถานที่จากประโยคก่อน
-    extracted_locations = extract_location_from_text(input_name)
-    if extracted_locations:
-        st.info(f"🔍 พบสถานที่ในประโยค: {', '.join(extracted_locations)}")
-        # ใช้สถานที่แรกที่พบ
-        input_name = extracted_locations[0]
-    
-    # 2. Fuzzy matching ตามปกติ
-    query = _normalize_text(input_name)
-    if not query:
+def fuzzy_best(input_text: str, threshold=THRESHOLD):
+    extracted = extract_location_from_text(input_text)
+    query = extracted[0] if extracted else input_text
+    query_norm = _normalize_text(query)
+    if not query_norm:
         return None, 0
-
-    result = rf_process.extractOne(
-        query,
-        correct_list,
-        scorer=rf_fuzz.token_set_ratio
-    )
-    if not result:
+    res = rf_process.extractOne(query_norm, ALL_PLACES, scorer=rf_fuzz.token_set_ratio)
+    if not res:
         return None, 0
+    name, score, _ = res
+    return (name, int(score)) if score >= threshold else (None, int(score))
 
-    best_name, best_score, _ = result
-    return (best_name, int(best_score)) if best_score >= threshold else (None, int(best_score))
-
-# --- 3. ส่วนแสดงผล Streamlit GUI ---
-st.set_page_config(layout="wide")
-st.title("🗺️ ระบบค้นหาพิกัดสถานที่ด้วย AI (Fuzzy Geocoding)")
-st.caption("ระบบรองรับการป้อนคำสั่งแบบ Hybrid (พิมพ์/เสียง) และแก้ไขคำผิดโดยอัตโนมัติ")
-st.markdown("---")
-
-# ----> แก้ไขจุดที่ 1: เพิ่ม 'location_input' เข้าไปใน session_state <----
-if 'latitude' not in st.session_state:
-    st.session_state['latitude'] = None
-    st.session_state['longitude'] = None
-    st.session_state['address'] = None
-    st.session_state['user_input'] = None
-    st.session_state['location_input'] = ""
-
-# ฟังก์ชัน Geocoding ที่จะบันทึกผลลัพธ์ลง session_state
-def geocode_location(location_to_search, user_input):
-    clean_query = (location_to_search or "").strip()
-    if not clean_query:
-        st.warning("โปรดป้อนชื่อสถานที่ที่ไม่ว่าง")
-        return
-
-    st.info(f"🚀 กำลังค้นหาพิกัดของ: **{clean_query}**")
-    geolocator_arcgis = ArcGIS(user_agent="arcgis_fuzzy_app_v2")
-    geolocator_nominatim = Nominatim(user_agent="nominatim_fuzzy_app_v2")
-    location = None
+# ========= Geocoding =========
+def geocode_location(q: str):
+    q = (q or "").strip()
+    if not q:
+        return None
+    geolocator_arcgis = ArcGIS(user_agent="arcgis_fuzzy_app")
+    geolocator_nominatim = Nominatim(user_agent="nominatim_fuzzy_app")
+    # ลอง ArcGIS ก่อน -> Nominatim
     try:
-        location = geolocator_arcgis.geocode(clean_query, timeout=10)
-        if not location:
-            location = geolocator_nominatim.geocode(clean_query, timeout=10)
+        loc = geolocator_arcgis.geocode(q, timeout=10)
+        if not loc:
+            loc = geolocator_nominatim.geocode(q, timeout=10)
+        return loc
     except Exception as e:
-        st.error(f"🚨 ข้อผิดพลาดในการติดต่อ API: โปรดตรวจสอบอินเทอร์เน็ต ({e})")
-        st.session_state['latitude'] = None
-        return
+        st.error(f"🚨 API geocoding ล้มเหลว: {e}")
+        return None
 
-    if location:
-        st.success("✅ ค้นพบพิกัดแล้ว!")
-        st.session_state['latitude'] = location.latitude
-        st.session_state['longitude'] = location.longitude
-        st.session_state['address'] = location.address
-        st.session_state['user_input'] = user_input
-    else:
-        st.warning(f"🚨 ไม่พบพิกัดสำหรับ '{clean_query}'")
-        st.session_state['latitude'] = None
+# ========= Streamlit UI =========
+st.set_page_config(page_title="Fuzzy Geocoding + Typhoon ASR", layout="wide", page_icon="🗺️")
 
-# ฟังก์ชันกลางสำหรับประมวลผลและค้นหา
-def process_and_search(user_input):
-    if not (user_input or "").strip():
-        st.warning("โปรดป้อนชื่อสถานที่ก่อนค้นหา")
-        return
-    
-    # 1. หาชื่อที่ตรงที่สุดในลิสต์ของเราก่อน
-    matched_name, score = get_best_match(user_input, CORRECT_LOCATIONS)
-    
-    # 2. เตรียมคำที่จะใช้ค้นหาจริง (ถ้าเจอในลิสต์ ก็ใช้ชื่อที่แก้แล้ว)
-    location_to_search = matched_name if matched_name else user_input
-    
-    # 3. แสดงผลถ้ามีการแก้ไขคำ
-    if matched_name:
-        st.success(f"🤖 AI แก้ไขคำผิดสำเร็จ: '{user_input}' ถูกเปลี่ยนเป็น '{matched_name}' (คะแนน: {score}%)")
-    
-    # 4. ค้นหาพิกัดเสมอ! (เอาออกมานอก if/else แล้ว)
-    geocode_location(location_to_search, user_input)
+# custom css: ลุคเรียบ ล้ำ
+st.markdown("""
+<style>
+/* ลดความหนาแน่น */
+.block-container {padding-top: 1.2rem; padding-bottom: 1rem;}
+/* card */
+.card {
+  border: 1px solid rgba(0,0,0,.08); border-radius: 16px; padding: 1rem 1rem; background: rgba(255,255,255,.6);
+  box-shadow: 0 8px 30px rgba(0,0,0,.04);
+}
+.kpi {font-size: 18px; opacity:.9}
+.small {opacity:.7; font-size: 13px}
+</style>
+""", unsafe_allow_html=True)
 
-col1, col2 = st.columns([1, 1])
+st.title(APP_TITLE)
+st.caption("พิมพ์/พูด เพื่อหา “พิกัดจริง” ของสถานที่ในไทย (รองรับสะกดเพี้ยน) • ถอดเสียงด้วย Typhoon ASR API")
 
-# คอลัมน์ซ้าย: อินพุตและผลลัพธ์ตัวเลข
-with col1:
-    st.subheader("1. ป้อนคำสั่ง")
-    
-    # ----> ปรับปรุง UI และเพิ่ม examples <----
-    st.markdown("📝 **ตัวอย่างการใช้งาน:**")
-    examples_col1, examples_col2 = st.columns(2)
-    
-    with examples_col1:
-        st.caption("🏯 **สถานศึกษา:**")
-        st.caption("• มอกะ (มหาวิทยาลัยเทคโนโลยี...)")
-        st.caption("• สถาปัจจุลาลงกร (จะแก้เป็น 'มหาวิทยาลัยชุลาลงกรณ์')")
-        st.caption("• เกษตร (มหาวิทยาลัยเกษตรศาสตร์)")
-    
-    with examples_col2:
-        st.caption("✈️ **สนาวบิน & สถานที่:**")
-        st.caption("• สุวรรณภูมิ")
-        st.caption("• อนุสาวรีย์ชัยสมรภูมิ")
-        st.caption("• วัดพระแก้ว")
-    
-    typed_input = st.text_input(
-        "📝 พิมพ์ชื่อสถานที่ (เช่น: มอกะ, สถาปัจจุลาลงกร)",
-        key="location_input",
-        help="สามารถพิมพ์ชื่อย่อ หรือพิมพ์ประโยคยาวๆ เช่น 'ฉันต้องการไปมหาวิทยาลัยกรุงเทพ'"
-    )
+if "lat" not in st.session_state:
+    st.session_state.update(dict(lat=None, lng=None, address=None, raw_input="", fixed_input=""))
 
-    if st.button("🔎 ค้นหาพิกัด", use_container_width=True):
-        process_and_search(typed_input)
-    
-    st.markdown("**หรือ** บันทึก/อัปโหลดไฟล์เสียง")
-    
-    # บันทึกเสียงแบบ real-time (ถ้ามี library)
-    if AUDIO_RECORDER_AVAILABLE:
-        st.markdown("🎙️ **บันทึกเสียงแบบ real-time**")
+with st.sidebar:
+    st.header("ตั้งค่า")
+    api_info = st.empty()
+    try:
+        _client, _model = make_client()
+        api_info.success(f"✅ Typhoon ASR ready • model: `{_model}`")
+    except Exception as e:
+        api_info.error(f"❌ API not ready: {e}")
+    st.divider()
+    st.write("**ไฟล์รายชื่อสถานที่**")
+    st.caption("อัปโหลด `th_places.txt` (ชื่อสถานที่บรรทัดละหนึ่งชื่อ) เพื่อเสริมคลังคำ")
+    place_file = st.file_uploader("อัปโหลด .txt", type=["txt"], label_visibility="collapsed")
+    if place_file:
+        try:
+            txt = place_file.read().decode("utf-8", errors="ignore")
+            extra = [l.strip() for l in txt.splitlines() if l.strip()]
+            global ALL_PLACES
+            ALL_PLACES = list(dict.fromkeys(ALL_PLACES + extra))
+            st.success(f"โหลดชื่อเพิ่ม {len(extra)} รายการ")
+        except Exception as e:
+            st.error(f"อ่านไฟล์ไม่สำเร็จ: {e}")
+
+colL, colR = st.columns([1,1])
+
+with colL:
+    st.subheader("อินพุต")
+
+    # 1) พิมพ์
+    typed = st.text_input("พิมพ์ชื่อสถานที่หรือบอกเป็นประโยค", key="raw_input", placeholder="เช่น: ไปสนามบินสุวรรณภูมิ / ไปวัดพระแก้ว")
+    go1 = st.button("🔎 ค้นหาพิกัดจากข้อความ", use_container_width=True)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.write("**ถอดเสียงด้วย Typhoon (อัด/อัปโหลด)**")
+    # 2) อัดเสียง (client-side mic → bytes)
+    audio_bytes = None
+    try:
+        from audio_recorder_streamlit import audio_recorder
         audio_bytes = audio_recorder(
-            text="กดเพื่อบันทึก",
+            text="กดเพื่ออัด/หยุด",
             recording_color="#e74c3c",
-            neutral_color="#34495e",
+            neutral_color="#2c3e50",
             icon_name="microphone",
             icon_size="2x",
             pause_threshold=2.0,
             sample_rate=16000
         )
-        
-        if audio_bytes:
-            st.success("✅ บันทึกเสียงสำเร็จ! กำลังถอดเสียง...")
-            model = load_whisper_model()
-            if model:
-                with st.spinner("🔍 กำลังถอดเสียง..."):
-                    transcribed_text = transcribe_audio(audio_bytes, model)
+    except Exception:
+        st.info("ฟีเจอร์อัดเสียงใช้ไม่ได้บนสภาพแวดล้อมนี้ — ใช้อัปโหลดไฟล์แทน")
 
-                if transcribed_text:
-                    st.success(f"📝 ข้อความที่ถอดได้: **{transcribed_text}**")
-                    st.session_state.location_input = transcribed_text
-                    process_and_search(transcribed_text)
-                    st.rerun()
-                else:
-                    st.warning("⚠️ ไม่สามารถถอดข้อความจากเสียงที่บันทึกได้")
-    else:
-        st.info("📝 **หมายเหตุ:** ฟีเจอร์บันทึกเสียงไม่พร้อมใช้งานบน Cloud - ใช้การอัปโหลดไฟล์แทน")
-    
-    st.markdown("**หรือ** อัปโหลดไฟล์เสียง")
-    st.file_uploader(
-        "🎵 อัปโหลดไฟล์เสียงเพื่อถอดข้อความ",
-        type=["wav", "mp3", "m4a", "flac", "ogg"],
-        help="รองรับไฟล์เสียงภาษาไทย (WAV, MP3, M4A, FLAC, OGG)",
-        key="audio_uploader",
-        on_change=handle_audio_upload
-    )
-
-    if st.session_state.latitude:
-        st.subheader("✅ ผลการค้นหา")
-        
-        # แสดงพิกัดในรูปแบบที่อ่านง่าย
-        col_lat, col_lng = st.columns(2)
-        with col_lat:
-            st.metric("📍 ละติจูด (Latitude)", f"{st.session_state.latitude:.6f}")
-        with col_lng:
-            st.metric("📍 ลองจิจูด (Longitude)", f"{st.session_state.longitude:.6f}")
-        
-        # แสดงที่อยู่แบบเต็ม
-        st.info(f"📍 **ที่อยู่แบบเต็ม:** {st.session_state.address}")
-        
-        # เพิ่มลิงก์ copy-paste สำหรับโดรน
-        coordinates_text = f"{st.session_state.latitude}, {st.session_state.longitude}"
-        st.code(f"Google Maps: https://maps.google.com/?q={coordinates_text}", language="text")
-        st.code(f"Drone Coordinates: {coordinates_text}", language="text")
-
-    st.subheader("2. ฟังก์ชันเสริมโครงการโดรน")
-    uploaded_image = st.file_uploader("📷 อัปโหลดภาพโดรนเพื่อยืนยันภารกิจ", type=["jpg", "jpeg", "png"])
-    if uploaded_image:
+    if audio_bytes:
+        st.success("ได้เสียงแล้ว กำลังถอดข้อความ…")
         try:
-            st.image(Image.open(uploaded_image), caption="ภาพที่อัปโหลด", use_column_width=True)
+            text_from_voice = typhoon_transcribe(audio_bytes, file_ext=".wav")
+            st.write("**ข้อความที่ถอดได้:**", text_from_voice or "—")
+            if text_from_voice:
+                st.session_state.raw_input = text_from_voice
+                go1 = True
         except Exception as e:
-            st.error(f"ไม่สามารถแสดงภาพที่อัปโหลดได้: {e}")
+            st.error(f"ถอดเสียงล้มเหลว: {e}")
 
-# คอลัมน์ขวา: แผนที่
-with col2:
+    # 3) อัปโหลดเสียง
+    up = st.file_uploader("อัปโหลดไฟล์เสียง (wav/mp3/m4a/ogg/flac)", type=["wav","mp3","m4a","ogg","flac"])
+    if up:
+        st.info("กำลังถอดข้อความจากไฟล์…")
+        try:
+            text_from_file = typhoon_transcribe(up.read(), file_ext=os.path.splitext(up.name)[1] or ".wav")
+            st.write("**ข้อความที่ถอดได้:**", text_from_file or "—")
+            if text_from_file:
+                st.session_state.raw_input = text_from_file
+                go1 = True
+        except Exception as e:
+            st.error(f"ถอดเสียงล้มเหลว: {e}")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ประมวลผลค้นหา
+    if go1:
+        q_orig = postprocess_text(st.session_state.raw_input)
+        best, score = fuzzy_best(q_orig)
+        query_to_geo = best or q_orig
+        if best:
+            st.success(f"🤖 แก้คำเป็น: **{best}** (คะแนน {score}%)")
+            st.session_state.fixed_input = best
+        else:
+            st.info("ใช้คำเดิมในการค้นหา (ไม่พบการแก้คำที่มั่นใจพอ)")
+            st.session_state.fixed_input = q_orig
+
+        with st.spinner(f"ค้นหาพิกัด: {query_to_geo}"):
+            loc = geocode_location(query_to_geo)
+        if loc:
+            st.session_state.lat = loc.latitude
+            st.session_state.lng = loc.longitude
+            st.session_state.address = loc.address
+            st.success("✅ พบพิกัดแล้ว")
+        else:
+            st.session_state.lat = st.session_state.lng = None
+            st.session_state.address = None
+            st.warning("ไม่พบพิกัดที่ตรงเงื่อนไข")
+
+    # แสดงผลลัพธ์ตัวเลข
+    if st.session_state.lat:
+        st.subheader("ผลลัพธ์")
+        c1, c2 = st.columns(2)
+        c1.metric("📍 Latitude", f"{st.session_state.lat:.6f}")
+        c2.metric("📍 Longitude", f"{st.session_state.lng:.6f}")
+        st.info(f"**ที่อยู่ (เต็ม):** {st.session_state.address}")
+        coords = f"{st.session_state.lat}, {st.session_state.lng}"
+        st.code(f"https://maps.google.com/?q={coords}", language="text")
+        st.code(coords, language="text")
+
+    # ภาพประกอบภารกิจโดรน
+    st.subheader("แนบภาพภารกิจ (ทางเลือก)")
+    img = st.file_uploader("อัปโหลดภาพ (jpg/png)", type=["jpg","jpeg","png"], key="imgu")
+    if img:
+        try:
+            st.image(Image.open(img), use_column_width=True)
+        except Exception as e:
+            st.error(f"แสดงภาพไม่สำเร็จ: {e}")
+
+with colR:
     st.subheader("แผนที่")
-    if st.session_state.latitude:
-        m = folium.Map(location=[st.session_state.latitude, st.session_state.longitude], zoom_start=15)
+    if st.session_state.lat:
+        m = folium.Map(location=[st.session_state.lat, st.session_state.lng], zoom_start=15)
         folium.Marker(
-            location=[st.session_state.latitude, st.session_state.longitude],
-            popup=f"📍 **{st.session_state.address}** (มาจาก '{st.session_state.user_input}')",
-            tooltip="ตำแหน่งที่ค้นหา"
+            location=[st.session_state.lat, st.session_state.lng],
+            popup=f"📍 {st.session_state.address}",
+            tooltip=st.session_state.fixed_input or st.session_state.raw_input
         ).add_to(m)
         if st_folium:
-            st_folium(m, width=700, height=500)
+            st_folium(m, width=720, height=520)
         else:
-            st.warning("ไม่พบไลบรารี streamlit-folium กรุณาติดตั้ง")
+            st.warning("ไม่ได้ติดตั้ง streamlit-folium: ติดตั้งเพื่อ render แผนที่ในแอป")
     else:
-        st.info("🗺️ แผนที่จะปรากฏที่นี่หลังจากการค้นหาสำเร็จ")
+        st.info("คำแนะนำ: พิมพ์หรือพูดชื่อสถานที่ แล้วกดค้นหา เพื่อให้แผนที่ปรากฏ")
