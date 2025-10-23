@@ -1,51 +1,74 @@
-# 🗺️ ระบบค้นหาพิกัดสถานที่ด้วย AI (Drone Geocoding App)
+## 🗺️ Drone Geocoding App — AI Location Finder
 
-ระบบค้นหาพิกัดสถานที่อัจฉริยะสำหรับโดรน รองรับการป้อนคำสั่งแบบ Hybrid (พิมพ์/เสียง) และแก้ไขคำผิดโดยอัตโนมัติ
+🚀 **Try It Yourself:**
+👉 [https://drone-geocoding-app.streamlit.app](https://drone-geocoding-app.streamlit.app)
 
-## ✨ คุณสมบัติหลัก
+---
 
-- 🎙️ **บันทึกเสียงแบบ Real-time** - กดปุ่มแล้วพูดได้เลย
-- 🧠 **AI ถอดเสียงภาษาไทยแม่นยำสูง** - ใช้ Whisper model ที่จูนพิเศษ
-- 🔍 **Fuzzy Matching** - แก้คำผิดอัตโนมัติ เช่น "มอกะ" → "มหาวิทยาลัยเทคโนโลยีพระจอมเกล้าพระนครเหนือ"
-- 🗺️ **แผนที่แบบ Interactive** - แสดงตำแหน่งบนแผนที่
-- 🎯 **รองรับการค้นหาจากประโยค** - เช่น "ฉันต้องการไปมหาวิทยาลัยกรุงเทพ"
-- 📍 **พิกัดแม่นยำ** - พร้อมลิงก์ Google Maps
+### 🎯 Project Overview
 
-## 🧠 หลักการทำงานแบบง่าย (How It Works)
+An AI-powered web app that converts **Thai text or speech** into **real-world coordinates (latitude & longitude)**.
+Built as a **final-year project** for the **Faculty of Engineering, Department of AI and Data Science**,
+this app simulates the **software module of a drone system**, allowing drones to query and receive target coordinates in real time.
 
-แอปนี้ทำงานเป็น Pipeline หลัก 3 ขั้นตอน:
+---
 
-1.  **AI Filter (Fuzzy Matching):**
+### ✨ Core Features
 
-      * เมื่อผู้ใช้ป้อนคำสั่ง (เช่น "มอกะเสด"), ระบบจะใช้ **`fuzzywuzzy`** และ **Levenshtein Distance** เพื่อคำนวณความคล้ายคลึงกับชื่อที่ถูกต้องในฐานข้อมูลของเรา (Knowledge Base)
-      * ถ้าคะแนนสูงกว่า **$80\%$** ระบบจะ **แก้ไขคำผิด** ให้ถูกต้องโดยอัตโนมัติ (เช่น เปลี่ยนเป็น "มหาวิทยาลัยเกษตรศาสตร์")
+* 🎙️ **Voice / Text / File Input** — Speak, type, or upload audio to find places.
+* 🧠 **Thai Speech Recognition (Typhoon ASR)** — Real-time, high-accuracy transcription.
+* 🔍 **Fuzzy Text Correction** — Automatically fixes typos or abbreviations.
+* 🗺️ **Interactive Map (Folium)** — Displays geocoded results with markers.
+* 📍 **Accurate Thai Locations** — Universities, provinces, landmarks, and airports.
 
-2.  **Geocoding (ArcGIS API):**
+---
 
-      * นำชื่อที่ถูกแก้ไขแล้วส่งไปยังบริการ **ArcGIS API** (ผ่าน `geopy`) เพื่อดึงพิกัด **L/R** ที่แม่นยำสูง
+### ⚙️ How It Works
 
-3.  **Visualization:**
+1. **Speech-to-Text:** Converts Thai voice input to text using the Typhoon ASR API.
+2. **Text Normalization:** Fixes typos and misspellings with RapidFuzz matching.
+3. **Geocoding:** Retrieves latitude & longitude from ArcGIS and Nominatim.
+4. **Map Display:** Visualizes coordinates interactively on a Folium map.
 
-      * ใช้ไลบรารี **`folium`** เพื่อสร้างแผนที่ Interactive และปักหมุดตำแหน่งที่พบ
+---
 
-## ✨ Features เด่นของระบบ
+### 🧩 Tech Stack
 
-  * **Hybrid Input:** รองรับการรับคำสั่งได้ทั้งจากการพิมพ์และการรับเสียง (ต้องใช้ `SpeechRecognition`).
-  * **Typo Correction:** แก้ไขคำผิดและตีความชื่อย่อได้โดยอัตโนมัติ.
-  * **Drone Proof (Conceptual):** มีฟังก์ชันอัปโหลดไฟล์ภาพเพื่อ **จำลองการรับภาพยืนยันภารกิจ** จากโดรน .
+* **Framework:** Streamlit
+* **ASR Engine:** Typhoon ASR (OpenAI-compatible)
+* **Geocoding:** ArcGIS + Nominatim (`geopy`)
+* **Fuzzy Matching:** RapidFuzz
+* **Map:** Folium + Streamlit-Folium
 
-## 🛠️ วิธีติดตั้งและรัน (Local Setup)
+---
 
-เพื่อให้แอปทำงานได้อย่างถูกต้องบนเครื่องของคุณ:
+### 🛠️ Quick Start
 
-1.  **Clone Repo:** คัดลอก Repository นี้ลงบนเครื่องของคุณ
-2.  **ติดตั้ง Requirements:** เปิด Terminal ในโฟลเดอร์โปรเจกต์แล้วติดตั้งไลบรารีที่จำเป็น:
-    ```bash
-    pip install -r requirements.txt
-    ```
-3.  **รันแอปด้วย Streamlit:**
-    ```bash
-    streamlit run app.py
-    ```
+```bash
+# 1. Clone repository
+git clone https://github.com/KengJoJo/drone-geocoding-app.git
+cd drone-geocoding-app
 
-## **หมายเหตุ:** การค้นหาพิกัดต้องอาศัยการเชื่อมต่ออินเทอร์เน็ตเพื่อติดต่อกับ **ArcGIS Geocoding Service**
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Run the app
+streamlit run app.py
+```
+
+> Optional: Add your Typhoon ASR credentials in `.env` or Streamlit Secrets.
+
+---
+
+### 🧠 About
+
+This project was developed as part of a **university capstone** in
+**Artificial Intelligence and Data Science Engineering** —
+focusing on how software AI components can integrate with drone hardware for autonomous mission control.
+
+---
+
+### 📄 License
+
+MIT © 2025 — Developed by **Keng JoJo**
+If you find this project helpful, feel free to ⭐️ star the repo or clone it to explore.
