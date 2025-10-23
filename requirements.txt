@@ -4,6 +4,7 @@ rapidfuzz
 folium
 streamlit-folium
 Pillow
-faster-whisper
+openai
 audio-recorder-streamlit
 pythainlp
+python-dotenv
