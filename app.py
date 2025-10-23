@@ -1,10 +1,5 @@
 # app.py
-import os
-import re
-import io
-import tempfile
-from datetime import datetime
-
+import os, re, io, tempfile, importlib, pathlib
 import streamlit as st
 from PIL import Image
 
@@ -12,7 +7,7 @@ from PIL import Image
 from geopy.geocoders import ArcGIS, Nominatim
 from rapidfuzz import process as rf_process, fuzz as rf_fuzz
 
-# Map (optional st_folium)
+# Map
 import folium
 try:
     from streamlit_folium import st_folium
@@ -26,7 +21,7 @@ try:
 except Exception:
     PYTHAINLP_AVAILABLE = False
 
-# OpenAI-compatible client (Typhoon)
+# OpenAI-compatible client (Typhoon API)
 from openai import OpenAI
 
 
@@ -35,48 +30,105 @@ from openai import OpenAI
 # =========================
 st.set_page_config(page_title="Fuzzy Geocoding + Typhoon ASR", layout="wide", page_icon="🗺️")
 
-APP_TITLE = "🗺️ Fuzzy Geocoding + Typhoon ASR"
-DEFAULT_MODEL = os.getenv("TYPHOON_MODEL", "typhoon-asr-realtime")
-DEFAULT_BASE  = os.getenv("OPENTYPHOON_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "https://api.opentyphoon.ai/v1"
-API_KEY       = os.getenv("OPENTYPHOON_API_KEY") or os.getenv("OPENAI_API_KEY")
-THRESHOLD     = 70  # fuzzy match threshold
+APP_TITLE   = "🗺️ Fuzzy Geocoding + Typhoon ASR"
+THRESHOLD   = 78  # ยก threshold ให้เข้มขึ้น เพื่อลดการแก้คำมั่ว
+STRICT_TAGS = ["มหาวิทยาลัย","มหาลัย","สนามบิน","ท่าอากาศยาน","วัด","โรงพยาบาล","อนุสาวรีย์","สถานี","BTS","MRT"]
+# ถ้าคำค้นมี tag ข้างบน จะ "บังคับ" ให้ fuzzy เลือกเฉพาะตัวเลือกที่มี tag นั้นด้วย (กันกรณี มหาลัยเชียงใหม่ → ตัดเหลือเชียงใหม่)
 
 
 # =========================
-# API client
+# โหลดคีย์จาก ENV/ไฟล์ 3 ตัว
 # =========================
-def make_client():
-    """
-    สร้าง OpenAI-compatible client สำหรับ Typhoon.
-    ถ้า ENV ไม่ครบ จะลองอ่านค่า fallback จากไฟล์ api_transcribe.py (ถ้ามี)
-    """
-    key  = API_KEY
-    base = DEFAULT_BASE
-    model= DEFAULT_MODEL
+def _extract_by_regex(text: str, patterns):
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return m.group(1).strip()
+    return None
 
-    if (not key) or (not base) or (not model):
+def load_typhoon_config_from_files():
+    """
+    ไล่หา key/base/model จากไฟล์ใน repo:
+    - import module ถ้าชื่อไฟล์ import ได้ (api_transcribe, typhoon_rt_toggle)
+    - อ่านไฟล์ดิบด้วย regex (รวม 1.PY)
+    คืนค่า: (api_key, base_url, model) (อันไหนหาไม่เจอเป็น None)
+    """
+    root = pathlib.Path(__file__).parent
+    candidate_modules = ["api_transcribe", "typhoon_rt_toggle"]
+    candidate_files   = ["api_transcribe.py", "typhoon_rt_toggle.py", "1.PY"]
+
+    key = base = model = None
+
+    # 1) module attributes
+    for mod in candidate_modules:
         try:
-            import api_transcribe as at
-            key   = key   or getattr(at, "API_KEY", None)
-            base  = base  or getattr(at, "BASE_URL", None)
-            model = model or getattr(at, "MODEL", None)
+            m = importlib.import_module(mod)
+            key   = key   or getattr(m, "API_KEY", None) or getattr(m, "OPENTYPHOON_API_KEY", None) or getattr(m, "OPENAI_API_KEY", None)
+            base  = base  or getattr(m, "BASE_URL", None) or getattr(m, "OPENAI_BASE_URL", None) or getattr(m, "OPENTYPHOON_BASE_URL", None)
+            model = model or getattr(m, "MODEL", None) or getattr(m, "TYPHOON_MODEL", None)
         except Exception:
             pass
+    if key and base and model:
+        return key, base, model
+
+    # 2) regex from raw files (incl. 1.PY)
+    key_pats = [
+        r'API_KEY\s*=\s*[\'"]([^\'"]+)[\'"]',
+        r'OPENTYPHOON_API_KEY\s*=\s*[\'"]([^\'"]+)[\'"]',
+        r'OPENAI_API_KEY\s*=\s*[\'"]([^\'"]+)[\'"]',
+    ]
+    base_pats = [
+        r'BASE_URL\s*=\s*[\'"]([^\'"]+)[\'"]',
+        r'OPENAI_BASE_URL\s*=\s*[\'"]([^\'"]+)[\'"]',
+        r'OPENTYPHOON_BASE_URL\s*=\s*[\'"]([^\'"]+)[\'"]',
+    ]
+    model_pats = [
+        r'MODEL\s*=\s*[\'"]([^\'"]+)[\'"]',
+        r'TYPHOON_MODEL\s*=\s*[\'"]([^\'"]+)[\'"]',
+    ]
+
+    for fname in candidate_files:
+        p = root / fname
+        if not p.exists(): 
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+            key   = key   or _extract_by_regex(text, key_pats)
+            base  = base  or _extract_by_regex(text, base_pats)
+            model = model or _extract_by_regex(text, model_pats)
+        except Exception:
+            pass
+    return key, base, model
+
+def make_client():
+    """
+    ลำดับการหา config:
+    1) ENV/Secrets (ถ้ามี)
+    2) ดึงจากไฟล์ 3 ตัว: api_transcribe.py, typhoon_rt_toggle.py, 1.PY
+    """
+    key   = os.getenv("OPENTYPHOON_API_KEY") or os.getenv("OPENAI_API_KEY")
+    base  = os.getenv("OPENTYPHOON_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+    model = os.getenv("TYPHOON_MODEL")
+
+    if not (key and base and model):
+        f_key, f_base, f_model = load_typhoon_config_from_files()
+        key   = key   or f_key
+        base  = base  or f_base
+        model = model or f_model
+
+    # ดีฟอลต์เมื่อไฟล์ไม่ได้กำหนด
+    base  = base  or "https://api.opentyphoon.ai/v1"
+    model = model or "typhoon-asr-realtime"
 
     if not key:
-        raise RuntimeError("ไม่พบ API key. โปรดตั้ง OPENTYPHOON_API_KEY (หรือ OPENAI_API_KEY) ใน Secrets/ENV")
-    if not base:
-        raise RuntimeError("ไม่พบ BASE_URL. โปรดตั้ง OPENTYPHOON_BASE_URL (หรือ OPENAI_BASE_URL)")
-    if not model:
-        raise RuntimeError("ไม่พบ MODEL. โปรดตั้ง TYPHOON_MODEL")
-
+        raise RuntimeError("ไม่พบ API Key ทั้งใน ENV และไฟล์ (api_transcribe.py / typhoon_rt_toggle.py / 1.PY)")
     return OpenAI(api_key=key, base_url=base), model
 
 
+# =========================
+# ASR
+# =========================
 def typhoon_transcribe(audio_bytes: bytes, file_ext: str = ".wav") -> str:
-    """
-    ส่งไฟล์เสียงไป Typhoon ASR (/audio/transcriptions) แล้วคืนข้อความ
-    """
     client, model = make_client()
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
         tmp.write(audio_bytes)
@@ -87,26 +139,23 @@ def typhoon_transcribe(audio_bytes: bytes, file_ext: str = ".wav") -> str:
         text = getattr(resp, "text", None)
         return postprocess_text((text or "").strip())
     finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+        try: os.unlink(tmp_path)
+        except Exception: pass
 
 
 # =========================
 # Text post-process
 # =========================
 _UNIT_WORDS = r'(เมตร|ม\.|กิโลเมตร|กม\.|เซนติเมตร|ซม\.|มิลลิเมตร|มม\.|วินาที|นาที|ชั่วโมง|องศา|%)'
-
 def postprocess_text(text: str) -> str:
-    if not text:
-        return ""
+    if not text: return ""
     x = re.sub(r'\s+', ' ', text).strip()
     x = re.sub(r'(\d)\s*' + _UNIT_WORDS, r'\1 \2', x)
     x = re.sub(r'(?<=[ก-๛A-Za-z])(?=\d)', ' ', x)
     x = re.sub(r'(?<=\d)(?=[ก-๛A-Za-z])', ' ', x)
-    # แก้ mapping เคยผิด
     x = x.replace("สุวรณภูมิ", "สุวรรณภูมิ")
+    # normalize คำเรียก
+    x = x.replace("มหาลัย","มหาวิทยาลัย")
     return x
 
 
@@ -116,12 +165,23 @@ def postprocess_text(text: str) -> str:
 BUILTIN_LOCATIONS = [
     "มหาวิทยาลัยเทคโนโลยีพระจอมเกล้าพระนครเหนือ",
     "มหาวิทยาลัยเกษตรศาสตร์",
-    "มหาวิทยาลัยกรุงเทพ",
     "จุฬาลงกรณ์มหาวิทยาลัย",
     "มหาวิทยาลัยมหิดล",
     "มหาวิทยาลัยธรรมศาสตร์",
     "มหาวิทยาลัยรามคำแหง",
     "มหาวิทยาลัยศรีนครินทรวิโรฒ",
+    "มหาวิทยาลัยกรุงเทพ",
+    "มหาวิทยาลัยเชียงใหม่",
+    "มหาวิทยาลัยขอนแก่น",
+    "มหาวิทยาลัยบูรพา",
+    "มหาวิทยาลัยสงขลานครินทร์",
+    "มหาวิทยาลัยนเรศวร",
+    "มหาวิทยาลัยศิลปากร",
+    "มหาวิทยาลัยเทคโนโลยีสุรนารี",
+    "มหาวิทยาลัยแม่ฟ้าหลวง",
+    "มหาวิทยาลัยมหาสารคาม",
+    "มหาวิทยาลัยเชียงรายราชภัฏ",  # ตัวอย่างราชภัฏ
+    "มหาวิทยาลัยปทุมธานี",
     "ท่าอากาศยานสุวรรณภูมิ",
     "ท่าอากาศยานดอนเมือง",
     "สนามบินสุวรรณภูมิ",
@@ -130,10 +190,13 @@ BUILTIN_LOCATIONS = [
     "วัดพระแก้ว",
     "วัดอรุณ",
     "พระบรมมหาราชวัง",
-    "พารากอน", "สยามพารากอน", "เซ็นทรัลเวิลด์",
-    "โรงพยาบาลจุฬาลงกรณ์", "โรงพยาบาลศิริราช", "โรงพยาบาลรามาธิบดี",
-    "จังหวัดภูเก็ต", "จังหวัดเชียงใหม่", "จังหวัดขอนแก่น", "จังหวัดสงขลา", "จังหวัดสุราษฎร์ธานี",
-    "เชียงใหม่", "ภูเก็ต", "พัทยา",
+    "สยามพารากอน",
+    "เซ็นทรัลเวิลด์",
+    "โรงพยาบาลศิริราช",
+    "โรงพยาบาลรามาธิบดี",
+    "โรงพยาบาลจุฬาลงกรณ์",
+    # จังหวัดหลัก ๆ
+    "จังหวัดเชียงใหม่","จังหวัดภูเก็ต","จังหวัดปทุมธานี","จังหวัดนนทบุรี","จังหวัดชลบุรี"
 ]
 
 def load_places_from_txt(filename="th_places.txt"):
@@ -146,7 +209,6 @@ def load_places_from_txt(filename="th_places.txt"):
         pass
     return BUILTIN_LOCATIONS
 
-# session state init
 BASE_PLACES = load_places_from_txt()
 if "ALL_PLACES" not in st.session_state:
     st.session_state.ALL_PLACES = BASE_PLACES
@@ -160,11 +222,13 @@ def _normalize_text(t: str) -> str:
 
 
 # =========================
-# Extract & Fuzzy
+# Extract & Fuzzy (ปรับ “ไม่มั่วจังหวัด”)
 # =========================
+def _contains_any(text: str, keywords):
+    return any(k in text for k in keywords)
+
 def extract_location_from_text(text: str):
-    if not text:
-        return []
+    if not text: return []
     text_norm = _normalize_text(text)
     out = []
 
@@ -192,7 +256,7 @@ def extract_location_from_text(text: str):
             if len(m) > 3:
                 out.append(m)
 
-    # 3) pythainlp (optional)
+    # 3) pythainlp (optional) — ดึงวลีติดกัน
     if PYTHAINLP_AVAILABLE:
         try:
             words = word_tokenize(text_norm, engine="newmm")
@@ -204,24 +268,60 @@ def extract_location_from_text(text: str):
         except Exception:
             pass
 
+    # unique + คืนลำดับแรกก่อน
     return list(dict.fromkeys(out))
 
+def _restrict_by_tag(candidates, required_tag):
+    # เก็บเฉพาะที่มีคำบ่งชี้ประเภทเดียวกัน
+    req = "มหาวิทยาลัย" if required_tag in ["มหาวิทยาลัย","มหาลัย"] else required_tag
+    return [c for c in candidates if req in c]
 
-def fuzzy_best(input_text: str, threshold=THRESHOLD):
-    extracted = extract_location_from_text(input_text)
-    query = extracted[0] if extracted else input_text
+def fuzzy_best(user_text: str, threshold=THRESHOLD):
+    user_text = postprocess_text(user_text)
+    text_norm = _normalize_text(user_text)
+
+    # tag-aware filtering (กันมั่วจังหวัด)
+    required_tag = None
+    for t in STRICT_TAGS:
+        if t in user_text:
+            required_tag = t
+            break
+
+    extracted = extract_location_from_text(user_text)
+    # ถ้ามี extracted หลายอัน ให้เลือกอันยาวสุด (specific สุด)
+    if extracted:
+        extracted = sorted(extracted, key=len, reverse=True)
+    query = extracted[0] if extracted else user_text
     query_norm = _normalize_text(query)
     if not query_norm:
         return None, 0
-    res = rf_process.extractOne(query_norm, get_places(), scorer=rf_fuzz.token_set_ratio)
+
+    # จำกัด candidate list ตาม tag ถ้าจำเป็น
+    candidates = get_places()
+    if required_tag:
+        candidates_tagged = _restrict_by_tag(candidates, required_tag)
+        if candidates_tagged:
+            candidates = candidates_tagged
+
+    # ถ้าคำค้นมีคำว่า "มหาวิทยาลัย" แต่ไม่มีในคลัง → ยังให้ geocode ด้วยคำเดิมก่อน
+    # และจะยอมแก้คำเฉพาะกรณีที่ผล fuzzy สูงมาก (ลด false positive)
+    scorer = rf_fuzz.token_set_ratio
+    res = rf_process.extractOne(query_norm, candidates, scorer=scorer)
     if not res:
         return None, 0
     name, score, _ = res
+
+    # ป้องกันกรณีลดความเฉพาะ: ถ้าผลลัพธ์สั้นกว่าคำถามมาก ๆ และไม่ได้มี tag เดียวกัน → ไม่รับ
+    if required_tag and required_tag not in name:
+        return None, int(score)
+
+    # ป้องกัน "มหาวิทยาลัยเชียงใหม่" → "เชียงใหม่" (ลด specificity)
+    if ("มหาวิทยาลัย" in query and "มหาวิทยาลัย" not in name):
+        return None, int(score)
+
     return (name, int(score)) if score >= threshold else (None, int(score))
 
-
 def correct_location(user_text: str, threshold: int = THRESHOLD):
-    """ wrapper ให้เข้ากับชื่อเดิมที่คุณคุ้นเคย """
     best, score = fuzzy_best(user_text, threshold=threshold)
     return best if best else None, score
 
@@ -231,8 +331,7 @@ def correct_location(user_text: str, threshold: int = THRESHOLD):
 # =========================
 def geocode_location(q: str):
     q = (q or "").strip()
-    if not q:
-        return None
+    if not q: return None
     geolocator_arcgis = ArcGIS(user_agent="arcgis_fuzzy_app")
     geolocator_nominatim = Nominatim(user_agent="nominatim_fuzzy_app")
     try:
@@ -251,19 +350,14 @@ def geocode_location(q: str):
 st.markdown("""
 <style>
 .block-container {padding-top: 1.2rem; padding-bottom: 1rem;}
-.card {
-  border: 1px solid rgba(0,0,0,.08); border-radius: 16px; padding: 1rem 1rem; background: rgba(255,255,255,.6);
-  box-shadow: 0 8px 30px rgba(0,0,0,.04);
-}
-.kpi {font-size: 18px; opacity:.9}
-.small {opacity:.7; font-size: 13px}
+.card { border: 1px solid rgba(0,0,0,.08); border-radius: 16px; padding: 1rem 1rem; background: rgba(255,255,255,.06);
+        box-shadow: 0 8px 30px rgba(0,0,0,.08); }
 </style>
 """, unsafe_allow_html=True)
 
 st.title(APP_TITLE)
-st.caption("พิมพ์/พูด เพื่อหา “พิกัดจริง” ของสถานที่ในไทย (รองรับสะกดเพี้ยน) • ถอดเสียงด้วย Typhoon ASR API")
+st.caption("พิมพ์/พูด เพื่อหา “พิกัดจริง” ของสถานที่ในไทย (รองรับสะกดเพี้ยน) • Typhoon ASR API")
 
-# init state
 if "lat" not in st.session_state:
     st.session_state.update(dict(lat=None, lng=None, address=None, raw_input="", fixed_input=""))
 
@@ -295,12 +389,10 @@ colL, colR = st.columns([1,1])
 with colL:
     st.subheader("อินพุต")
 
-    # พิมพ์ข้อความ
     typed = st.text_input("พิมพ์ชื่อสถานที่หรือบอกเป็นประโยค", key="raw_input",
-                          placeholder="เช่น: ไปสนามบินสุวรรณภูมิ / ไปวัดพระแก้ว")
+                          placeholder="เช่น: ไปมหาวิทยาลัยเชียงใหม่ / ไปวัดพระแก้ว / ไปสนามบินสุวรรณภูมิ")
     go1 = st.button("🔎 ค้นหาพิกัดจากข้อความ", use_container_width=True)
 
-    # อัด/อัปโหลดเสียง
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.write("**ถอดเสียงด้วย Typhoon (อัด/อัปโหลด)**")
 
@@ -346,33 +438,35 @@ with colL:
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # ประมวลผลค้นหา
     if go1:
         q_orig = postprocess_text(st.session_state.raw_input)
-        candidate, score = correct_location(q_orig, threshold=THRESHOLD)
-        query_to_geo = candidate or q_orig
 
-        if candidate:
-            st.success(f"🤖 แก้คำเป็น: **{candidate}** (คะแนน {score}%)")
-            st.session_state.fixed_input = candidate
-        else:
-            st.info("ใช้คำเดิมในการค้นหา (ไม่พบการแก้คำที่มั่นใจพอ)")
-            st.session_state.fixed_input = q_orig
+        # ลำดับใหม่: 1) geocode ด้วยคำเดิมก่อน 2) ถ้าไม่เจอค่อยลอง correct
+        loc = geocode_location(q_orig)
+        used = q_orig
+        corrected_used = False
 
-        with st.spinner(f"ค้นหาพิกัด: {query_to_geo}"):
-            loc = geocode_location(query_to_geo)
+        if not loc:
+            cand, score = correct_location(q_orig, threshold=THRESHOLD)
+            if cand:
+                loc = geocode_location(cand)
+                used = cand
+                corrected_used = True
 
         if loc:
             st.session_state.lat = loc.latitude
             st.session_state.lng = loc.longitude
             st.session_state.address = loc.address
-            st.success("✅ พบพิกัดแล้ว")
+            st.session_state.fixed_input = used
+            if corrected_used:
+                st.success(f"✅ พบพิกัด (หลังแก้คำ): **{used}**")
+            else:
+                st.success(f"✅ พบพิกัดจากข้อความเดิม")
         else:
             st.session_state.lat = st.session_state.lng = None
             st.session_state.address = None
             st.warning("ไม่พบพิกัดที่ตรงเงื่อนไข")
 
-    # แสดงผลตัวเลข/ลิงก์
     if st.session_state.lat:
         st.subheader("ผลลัพธ์")
         c1, c2 = st.columns(2)
