@@ -31,9 +31,18 @@ from openai import OpenAI
 st.set_page_config(page_title="Fuzzy Geocoding + Typhoon ASR", layout="wide", page_icon="🗺️")
 
 APP_TITLE   = "🗺️ Fuzzy Geocoding + Typhoon ASR"
-THRESHOLD   = 78  # ยก threshold ให้เข้มขึ้น เพื่อลดการแก้คำมั่ว
+THRESHOLD   = 78  # เข้มขึ้น ลดการแก้คำมั่ว
 STRICT_TAGS = ["มหาวิทยาลัย","มหาลัย","สนามบิน","ท่าอากาศยาน","วัด","โรงพยาบาล","อนุสาวรีย์","สถานี","BTS","MRT"]
-# ถ้าคำค้นมี tag ข้างบน จะ "บังคับ" ให้ fuzzy เลือกเฉพาะตัวเลือกที่มี tag นั้นด้วย (กันกรณี มหาลัยเชียงใหม่ → ตัดเหลือเชียงใหม่)
+
+# widget keys / temp states (สำคัญ: แยก key ของ widget ออกจากค่าที่เราจะอัปเดตเอง)
+INPUT_WIDGET_KEY = "raw_input_widget"
+TRANSCRIBED_KEY  = "transcribed_text"
+
+# init state
+if "lat" not in st.session_state:
+    st.session_state.update(dict(lat=None, lng=None, address=None, fixed_input=""))
+if TRANSCRIBED_KEY not in st.session_state:
+    st.session_state[TRANSCRIBED_KEY] = ""
 
 
 # =========================
@@ -49,7 +58,7 @@ def _extract_by_regex(text: str, patterns):
 def load_typhoon_config_from_files():
     """
     ไล่หา key/base/model จากไฟล์ใน repo:
-    - import module ถ้าชื่อไฟล์ import ได้ (api_transcribe, typhoon_rt_toggle)
+    - import module ถ้าไฟล์ import ได้ (api_transcribe, typhoon_rt_toggle)
     - อ่านไฟล์ดิบด้วย regex (รวม 1.PY)
     คืนค่า: (api_key, base_url, model) (อันไหนหาไม่เจอเป็น None)
     """
@@ -89,7 +98,7 @@ def load_typhoon_config_from_files():
 
     for fname in candidate_files:
         p = root / fname
-        if not p.exists(): 
+        if not p.exists():
             continue
         try:
             text = p.read_text(encoding="utf-8", errors="ignore")
@@ -153,8 +162,8 @@ def postprocess_text(text: str) -> str:
     x = re.sub(r'(\d)\s*' + _UNIT_WORDS, r'\1 \2', x)
     x = re.sub(r'(?<=[ก-๛A-Za-z])(?=\d)', ' ', x)
     x = re.sub(r'(?<=\d)(?=[ก-๛A-Za-z])', ' ', x)
-    x = x.replace("สุวรณภูมิ", "สุวรรณภูมิ")
     # normalize คำเรียก
+    x = x.replace("สุวรณภูมิ", "สุวรรณภูมิ")
     x = x.replace("มหาลัย","มหาวิทยาลัย")
     return x
 
@@ -163,6 +172,7 @@ def postprocess_text(text: str) -> str:
 # Place list (built-in + optional txt)
 # =========================
 BUILTIN_LOCATIONS = [
+    # มหาวิทยาลัย (ตัวอย่างหลัก ๆ)
     "มหาวิทยาลัยเทคโนโลยีพระจอมเกล้าพระนครเหนือ",
     "มหาวิทยาลัยเกษตรศาสตร์",
     "จุฬาลงกรณ์มหาวิทยาลัย",
@@ -180,8 +190,8 @@ BUILTIN_LOCATIONS = [
     "มหาวิทยาลัยเทคโนโลยีสุรนารี",
     "มหาวิทยาลัยแม่ฟ้าหลวง",
     "มหาวิทยาลัยมหาสารคาม",
-    "มหาวิทยาลัยเชียงรายราชภัฏ",  # ตัวอย่างราชภัฏ
     "มหาวิทยาลัยปทุมธานี",
+    # แลนด์มาร์ก/รพ./สนามบิน
     "ท่าอากาศยานสุวรรณภูมิ",
     "ท่าอากาศยานดอนเมือง",
     "สนามบินสุวรรณภูมิ",
@@ -195,7 +205,7 @@ BUILTIN_LOCATIONS = [
     "โรงพยาบาลศิริราช",
     "โรงพยาบาลรามาธิบดี",
     "โรงพยาบาลจุฬาลงกรณ์",
-    # จังหวัดหลัก ๆ
+    # จังหวัดตัวอย่าง (กัน fallback)
     "จังหวัดเชียงใหม่","จังหวัดภูเก็ต","จังหวัดปทุมธานี","จังหวัดนนทบุรี","จังหวัดชลบุรี"
 ]
 
@@ -222,11 +232,8 @@ def _normalize_text(t: str) -> str:
 
 
 # =========================
-# Extract & Fuzzy (ปรับ “ไม่มั่วจังหวัด”)
+# Extract & Fuzzy (ไม่ลดความเฉพาะเจาะจง)
 # =========================
-def _contains_any(text: str, keywords):
-    return any(k in text for k in keywords)
-
 def extract_location_from_text(text: str):
     if not text: return []
     text_norm = _normalize_text(text)
@@ -256,7 +263,7 @@ def extract_location_from_text(text: str):
             if len(m) > 3:
                 out.append(m)
 
-    # 3) pythainlp (optional) — ดึงวลีติดกัน
+    # 3) pythainlp (optional)
     if PYTHAINLP_AVAILABLE:
         try:
             words = word_tokenize(text_norm, engine="newmm")
@@ -268,55 +275,40 @@ def extract_location_from_text(text: str):
         except Exception:
             pass
 
-    # unique + คืนลำดับแรกก่อน
     return list(dict.fromkeys(out))
 
 def _restrict_by_tag(candidates, required_tag):
-    # เก็บเฉพาะที่มีคำบ่งชี้ประเภทเดียวกัน
     req = "มหาวิทยาลัย" if required_tag in ["มหาวิทยาลัย","มหาลัย"] else required_tag
     return [c for c in candidates if req in c]
 
 def fuzzy_best(user_text: str, threshold=THRESHOLD):
     user_text = postprocess_text(user_text)
-    text_norm = _normalize_text(user_text)
-
-    # tag-aware filtering (กันมั่วจังหวัด)
-    required_tag = None
-    for t in STRICT_TAGS:
-        if t in user_text:
-            required_tag = t
-            break
+    required_tag = next((t for t in STRICT_TAGS if t in user_text), None)
 
     extracted = extract_location_from_text(user_text)
-    # ถ้ามี extracted หลายอัน ให้เลือกอันยาวสุด (specific สุด)
     if extracted:
-        extracted = sorted(extracted, key=len, reverse=True)
+        extracted = sorted(extracted, key=len, reverse=True)  # เอาอันยาวสุด (specific)
     query = extracted[0] if extracted else user_text
     query_norm = _normalize_text(query)
     if not query_norm:
         return None, 0
 
-    # จำกัด candidate list ตาม tag ถ้าจำเป็น
     candidates = get_places()
     if required_tag:
-        candidates_tagged = _restrict_by_tag(candidates, required_tag)
-        if candidates_tagged:
-            candidates = candidates_tagged
+        tagged = _restrict_by_tag(candidates, required_tag)
+        if tagged:
+            candidates = tagged
 
-    # ถ้าคำค้นมีคำว่า "มหาวิทยาลัย" แต่ไม่มีในคลัง → ยังให้ geocode ด้วยคำเดิมก่อน
-    # และจะยอมแก้คำเฉพาะกรณีที่ผล fuzzy สูงมาก (ลด false positive)
-    scorer = rf_fuzz.token_set_ratio
-    res = rf_process.extractOne(query_norm, candidates, scorer=scorer)
+    res = rf_process.extractOne(query_norm, candidates, scorer=rf_fuzz.token_set_ratio)
     if not res:
         return None, 0
     name, score, _ = res
 
-    # ป้องกันกรณีลดความเฉพาะ: ถ้าผลลัพธ์สั้นกว่าคำถามมาก ๆ และไม่ได้มี tag เดียวกัน → ไม่รับ
-    if required_tag and required_tag not in name:
-        return None, int(score)
-
-    # ป้องกัน "มหาวิทยาลัยเชียงใหม่" → "เชียงใหม่" (ลด specificity)
+    # ไม่ยอมลดความเฉพาะ: ถ้าคำค้นมี "มหาวิทยาลัย" แต่คำตอบไม่มี → ไม่รับ
     if ("มหาวิทยาลัย" in query and "มหาวิทยาลัย" not in name):
+        return None, int(score)
+    # ถ้าระบุ tag แล้วแต่ผลไม่มี tag นั้น → ไม่รับ
+    if required_tag and required_tag not in name:
         return None, int(score)
 
     return (name, int(score)) if score >= threshold else (None, int(score))
@@ -358,9 +350,6 @@ st.markdown("""
 st.title(APP_TITLE)
 st.caption("พิมพ์/พูด เพื่อหา “พิกัดจริง” ของสถานที่ในไทย (รองรับสะกดเพี้ยน) • Typhoon ASR API")
 
-if "lat" not in st.session_state:
-    st.session_state.update(dict(lat=None, lng=None, address=None, raw_input="", fixed_input=""))
-
 with st.sidebar:
     st.header("ตั้งค่า")
     api_info = st.empty()
@@ -389,8 +378,12 @@ colL, colR = st.columns([1,1])
 with colL:
     st.subheader("อินพุต")
 
-    typed = st.text_input("พิมพ์ชื่อสถานที่หรือบอกเป็นประโยค", key="raw_input",
-                          placeholder="เช่น: ไปมหาวิทยาลัยเชียงใหม่ / ไปวัดพระแก้ว / ไปสนามบินสุวรรณภูมิ")
+    # ช่องพิมพ์ (อย่าไปแก้ session_state ของ key นี้หลังสร้างแล้ว)
+    typed = st.text_input(
+        "พิมพ์ชื่อสถานที่หรือบอกเป็นประโยค",
+        key=INPUT_WIDGET_KEY,
+        placeholder="เช่น: ไปมหาวิทยาลัยเชียงใหม่ / ไปวัดพระแก้ว / ไปสนามบินสุวรรณภูมิ"
+    )
     go1 = st.button("🔎 ค้นหาพิกัดจากข้อความ", use_container_width=True)
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -417,7 +410,7 @@ with colL:
             text_from_voice = typhoon_transcribe(audio_bytes, file_ext=".wav")
             st.write("**ข้อความที่ถอดได้:**", text_from_voice or "—")
             if text_from_voice:
-                st.session_state.raw_input = text_from_voice
+                st.session_state[TRANSCRIBED_KEY] = text_from_voice  # เก็บชั่วคราว (ไม่แตะ key ของ widget)
                 go1 = True
         except Exception as e:
             st.error(f"ถอดเสียงล้มเหลว: {e}")
@@ -431,17 +424,21 @@ with colL:
             text_from_file = typhoon_transcribe(up.read(), file_ext=ext)
             st.write("**ข้อความที่ถอดได้:**", text_from_file or "—")
             if text_from_file:
-                st.session_state.raw_input = text_from_file
+                st.session_state[TRANSCRIBED_KEY] = text_from_file  # เก็บชั่วคราว
                 go1 = True
         except Exception as e:
             st.error(f"ถอดเสียงล้มเหลว: {e}")
 
     st.markdown('</div>', unsafe_allow_html=True)
 
+    # ใช้ข้อความที่มีอยู่จริง: ถ้ามีผลถอดเสียง → ใช้อันนั้นก่อน, ไม่งั้นใช้ค่าที่พิมพ์
     if go1:
-        q_orig = postprocess_text(st.session_state.raw_input)
+        effective_text = st.session_state.get(TRANSCRIBED_KEY) or st.session_state.get(INPUT_WIDGET_KEY, "")
+        st.session_state[TRANSCRIBED_KEY] = ""  # เคลียร์ buffer
 
-        # ลำดับใหม่: 1) geocode ด้วยคำเดิมก่อน 2) ถ้าไม่เจอค่อยลอง correct
+        q_orig = postprocess_text(effective_text)
+
+        # ลอง geocode ด้วยคำเดิมก่อน → ถ้าไม่เจอ ค่อยลอง correct (ลด false positive)
         loc = geocode_location(q_orig)
         used = q_orig
         corrected_used = False
@@ -461,7 +458,7 @@ with colL:
             if corrected_used:
                 st.success(f"✅ พบพิกัด (หลังแก้คำ): **{used}**")
             else:
-                st.success(f"✅ พบพิกัดจากข้อความเดิม")
+                st.success("✅ พบพิกัดจากข้อความเดิม")
         else:
             st.session_state.lat = st.session_state.lng = None
             st.session_state.address = None
@@ -492,7 +489,7 @@ with colR:
         folium.Marker(
             location=[st.session_state.lat, st.session_state.lng],
             popup=f"📍 {st.session_state.address}",
-            tooltip=st.session_state.fixed_input or st.session_state.raw_input
+            tooltip=st.session_state.fixed_input or st.session_state.get(INPUT_WIDGET_KEY, "")
         ).add_to(m)
         if st_folium:
             st_folium(m, width=720, height=520)
