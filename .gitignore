@@ -15,8 +15,8 @@ dist/
 venv/
 ENV/
 
-# Streamlit
-.streamlit/
+# Streamlit (but keep secrets.toml.example)
+.streamlit/secrets.toml
 
 # OS / Editors
 .DS_Store
@@ -30,3 +30,7 @@ Thumbs.db
 # Local artifacts
 *.bak
 *.swp
+
+# Sensitive config files
+config.py
+.env

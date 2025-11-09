@@ -4,9 +4,9 @@
 import os, sys, glob
 from openai import OpenAI
 
-# --- ตั้งค่าพื้นฐาน (แนะนำย้ายคีย์ไป ENV/.env แล้วรีเซ็ตคีย์ที่เผลอโพสต์) ---
-API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENTYPHOON_API_KEY") \
-          or "sk-TOMgVGReGUKdwJ4h1TztgVvcfprmpEI3vp9RptvchRLd5Fsb"   # ← เปลี่ยนเป็นคีย์ของคุณ หรือใช้ ENV
+# --- ตั้งค่าพื้นฐาน ---
+# ⚠️ DO NOT hardcode API keys! Use ENV or Streamlit Secrets
+API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENTYPHOON_API_KEY")
 BASE_URL = os.getenv("OPENTYPHOON_BASE_URL", "https://api.opentyphoon.ai/v1")
 MODEL    = os.getenv("TYPHOON_MODEL", "typhoon-asr-realtime")
 # -------------------------------------------------------------------------------

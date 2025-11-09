@@ -59,15 +59,23 @@ def _extract_by_regex(text: str, patterns):
 
 def load_google_maps_key():
     """
-    โหลด Google Maps API key จาก ENV หรือไฟล์
+    โหลด Google Maps API key จาก Streamlit Secrets, ENV, หรือไฟล์
     คืนค่า: api_key (str หรือ None)
     """
-    # 1) ENV
+    # 1) Streamlit Secrets (highest priority)
+    try:
+        key = st.secrets.get("GOOGLE_MAPS_API_KEY") or st.secrets.get("GOOGLE_API_KEY")
+        if key:
+            return key
+    except Exception:
+        pass
+    
+    # 2) ENV
     key = os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if key:
         return key
     
-    # 2) ไฟล์ config
+    # 3) ไฟล์ config (legacy, not recommended)
     root = pathlib.Path(__file__).parent
     candidate_files = ["api_transcribe.py", "typhoon_rt_toggle.py", "1.PY", "config.py"]
     key_pats = [
@@ -146,12 +154,25 @@ def load_typhoon_config_from_files():
 def make_client():
     """
     ลำดับการหา config:
-    1) ENV/Secrets (ถ้ามี)
-    2) ดึงจากไฟล์ 3 ตัว: api_transcribe.py, typhoon_rt_toggle.py, 1.PY
+    1) Streamlit Secrets (highest priority)
+    2) ENV/Secrets
+    3) ดึงจากไฟล์: api_transcribe.py, typhoon_rt_toggle.py, 1.PY
     """
-    key   = os.getenv("OPENTYPHOON_API_KEY") or os.getenv("OPENAI_API_KEY")
-    base  = os.getenv("OPENTYPHOON_BASE_URL") or os.getenv("OPENAI_BASE_URL")
-    model = os.getenv("TYPHOON_MODEL")
+    # 1) Streamlit Secrets
+    try:
+        key   = st.secrets.get("OPENTYPHOON_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+        base  = st.secrets.get("OPENTYPHOON_BASE_URL") or st.secrets.get("OPENAI_BASE_URL")
+        model = st.secrets.get("TYPHOON_MODEL")
+    except Exception:
+        key = base = model = None
+    
+    # 2) ENV
+    if not key:
+        key = os.getenv("OPENTYPHOON_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not base:
+        base = os.getenv("OPENTYPHOON_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+    if not model:
+        model = os.getenv("TYPHOON_MODEL")
 
     if not (key and base and model):
         f_key, f_base, f_model = load_typhoon_config_from_files()
