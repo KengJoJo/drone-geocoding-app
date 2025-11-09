@@ -43,6 +43,8 @@ if "lat" not in st.session_state:
     st.session_state.update(dict(lat=None, lng=None, address=None, fixed_input=""))
 if TRANSCRIBED_KEY not in st.session_state:
     st.session_state[TRANSCRIBED_KEY] = ""
+if "all_locations" not in st.session_state:
+    st.session_state["all_locations"] = []  # เก็บ [{"name": str, "lat": float, "lng": float, "address": str}]
 
 
 # =========================
@@ -53,6 +55,38 @@ def _extract_by_regex(text: str, patterns):
         m = re.search(pat, text)
         if m:
             return m.group(1).strip()
+    return None
+
+def load_google_maps_key():
+    """
+    โหลด Google Maps API key จาก ENV หรือไฟล์
+    คืนค่า: api_key (str หรือ None)
+    """
+    # 1) ENV
+    key = os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if key:
+        return key
+    
+    # 2) ไฟล์ config
+    root = pathlib.Path(__file__).parent
+    candidate_files = ["api_transcribe.py", "typhoon_rt_toggle.py", "1.PY", "config.py"]
+    key_pats = [
+        r'GOOGLE_MAPS_API_KEY\s*=\s*[\'"]([^\'"]+)[\'"]',
+        r'GOOGLE_API_KEY\s*=\s*[\'"]([^\'"]+)[\'"]',
+    ]
+    
+    for fname in candidate_files:
+        p = root / fname
+        if not p.exists():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+            key = _extract_by_regex(text, key_pats)
+            if key:
+                return key
+        except Exception:
+            pass
+    
     return None
 
 def load_typhoon_config_from_files():
@@ -234,7 +268,12 @@ def _normalize_text(t: str) -> str:
 # =========================
 # Extract & Fuzzy (ไม่ลดความเฉพาะเจาะจง)
 # =========================
-def extract_location_from_text(text: str):
+def extract_location_from_text(text: str, return_all=False):
+    """
+    แกะสถานที่จากประโยค
+    return_all=True: คืนค่าทุกสถานที่ที่เจอ (สำหรับจำลองโดรนหลายจุด)
+    return_all=False: คืนค่าอันเดียว (เดิม)
+    """
     if not text: return []
     text_norm = _normalize_text(text)
     out = []
@@ -275,20 +314,32 @@ def extract_location_from_text(text: str):
         except Exception:
             pass
 
-    return list(dict.fromkeys(out))
+    result = list(dict.fromkeys(out))  # ลบซ้ำแต่เก็บลำดับ
+    
+    if return_all:
+        return result  # คืนทั้งหมด
+    else:
+        return result  # คืนทั้งหมด (แต่เดิมจะเอาแค่อันเดียว ตอนนี้ปล่อยให้ caller จัดการ)
 
 def _restrict_by_tag(candidates, required_tag):
     req = "มหาวิทยาลัย" if required_tag in ["มหาวิทยาลัย","มหาลัย"] else required_tag
     return [c for c in candidates if req in c]
 
-def fuzzy_best(user_text: str, threshold=THRESHOLD):
+def fuzzy_best(user_text: str, threshold=THRESHOLD, query_override=None):
+    """
+    query_override: ถ้าส่งมา จะใช้ค่านี้แทนการ extract จาก user_text
+    """
     user_text = postprocess_text(user_text)
     required_tag = next((t for t in STRICT_TAGS if t in user_text), None)
 
-    extracted = extract_location_from_text(user_text)
-    if extracted:
-        extracted = sorted(extracted, key=len, reverse=True)  # เอาอันยาวสุด (specific)
-    query = extracted[0] if extracted else user_text
+    if query_override:
+        query = query_override
+    else:
+        extracted = extract_location_from_text(user_text, return_all=False)
+        if extracted:
+            extracted = sorted(extracted, key=len, reverse=True)  # เอาอันยาวสุด (specific)
+        query = extracted[0] if extracted else user_text
+    
     query_norm = _normalize_text(query)
     if not query_norm:
         return None, 0
@@ -352,12 +403,23 @@ st.caption("พิมพ์/พูด เพื่อหา “พิกัด�
 
 with st.sidebar:
     st.header("ตั้งค่า")
+    
+    # Typhoon ASR status
     api_info = st.empty()
     try:
         _client, _model = make_client()
         api_info.success(f"✅ Typhoon ASR ready • model: `{_model}`")
     except Exception as e:
         api_info.error(f"❌ API not ready: {e}")
+    
+    # Google Maps API status
+    gmaps_info = st.empty()
+    gmaps_key = load_google_maps_key()
+    if gmaps_key:
+        masked_key = gmaps_key[:10] + "***" + gmaps_key[-4:] if len(gmaps_key) > 14 else "***"
+        gmaps_info.success(f"✅ Google Maps API ready • key: `{masked_key}`")
+    else:
+        gmaps_info.warning("⚠️ Google Maps API key not configured")
 
     st.divider()
     st.write("**ไฟล์รายชื่อสถานที่**")
@@ -438,41 +500,84 @@ with colL:
 
         q_orig = postprocess_text(effective_text)
 
-        # ลอง geocode ด้วยคำเดิมก่อน → ถ้าไม่เจอ ค่อยลอง correct (ลด false positive)
-        loc = geocode_location(q_orig)
-        used = q_orig
-        corrected_used = False
-
-        if not loc:
-            cand, score = correct_location(q_orig, threshold=THRESHOLD)
-            if cand:
-                loc = geocode_location(cand)
-                used = cand
-                corrected_used = True
-
-        if loc:
-            st.session_state.lat = loc.latitude
-            st.session_state.lng = loc.longitude
-            st.session_state.address = loc.address
-            st.session_state.fixed_input = used
-            if corrected_used:
-                st.success(f"✅ พบพิกัด (หลังแก้คำ): **{used}**")
+        # แกะทุกสถานที่ในประโยค
+        extracted_places = extract_location_from_text(q_orig, return_all=True)
+        
+        # ถ้าไม่เจอสถานที่เลย ใช้ทั้งประโยค
+        if not extracted_places:
+            extracted_places = [q_orig]
+        
+        all_results = []
+        
+        for place_text in extracted_places:
+            # ลอง geocode ด้วยคำเดิมก่อน
+            loc = geocode_location(place_text)
+            used_name = place_text
+            corrected = False
+            
+            if not loc:
+                # ลอง correct
+                cand, score = correct_location(place_text, threshold=THRESHOLD)
+                if cand:
+                    loc = geocode_location(cand)
+                    used_name = cand
+                    corrected = True
+            
+            if loc:
+                all_results.append({
+                    "name": used_name,
+                    "lat": loc.latitude,
+                    "lng": loc.longitude,
+                    "address": loc.address,
+                    "corrected": corrected
+                })
+        
+        if all_results:
+            st.session_state.all_locations = all_results
+            # เก็บสถานที่แรกใน state เดิม (backward compatible)
+            st.session_state.lat = all_results[0]["lat"]
+            st.session_state.lng = all_results[0]["lng"]
+            st.session_state.address = all_results[0]["address"]
+            st.session_state.fixed_input = all_results[0]["name"]
+            
+            if len(all_results) == 1:
+                if all_results[0]["corrected"]:
+                    st.success(f"✅ พบพิกัด (หลังแก้คำ): **{all_results[0]['name']}**")
+                else:
+                    st.success("✅ พบพิกัดจากข้อความเดิม")
             else:
-                st.success("✅ พบพิกัดจากข้อความเดิม")
+                st.success(f"✅ พบ {len(all_results)} สถานที่จากประโยค")
         else:
             st.session_state.lat = st.session_state.lng = None
             st.session_state.address = None
+            st.session_state.all_locations = []
             st.warning("ไม่พบพิกัดที่ตรงเงื่อนไข")
 
     if st.session_state.lat:
         st.subheader("ผลลัพธ์")
-        c1, c2 = st.columns(2)
-        c1.metric("📍 Latitude", f"{st.session_state.lat:.6f}")
-        c2.metric("📍 Longitude", f"{st.session_state.lng:.6f}")
-        st.info(f"**ที่อยู่ (เต็ม):** {st.session_state.address}")
-        coords = f"{st.session_state.lat}, {st.session_state.lng}"
-        st.code(f"https://maps.google.com/?q={coords}", language="text")
-        st.code(coords, language="text")
+        
+        # แสดงทุกสถานที่
+        all_locs = st.session_state.get("all_locations", [])
+        if len(all_locs) > 1:
+            st.info(f"🗺️ พบ **{len(all_locs)} สถานที่** ในประโยค (แสดงเส้นทางบนแผนที่)")
+            for idx, loc_data in enumerate(all_locs, 1):
+                st.markdown(f"### สถานที่ที่ {idx}: {loc_data['name']}")
+                c1, c2 = st.columns(2)
+                c1.metric("📍 Latitude", f"{loc_data['lat']:.6f}")
+                c2.metric("📍 Longitude", f"{loc_data['lng']:.6f}")
+                coords = f"{loc_data['lat']}, {loc_data['lng']}"
+                st.code(coords, language="text")
+                if idx < len(all_locs):
+                    st.markdown("⬇️")
+        else:
+            # สถานที่เดียว
+            c1, c2 = st.columns(2)
+            c1.metric("📍 Latitude", f"{st.session_state.lat:.6f}")
+            c2.metric("📍 Longitude", f"{st.session_state.lng:.6f}")
+            st.info(f"**ที่อยู่ (เต็ม):** {st.session_state.address}")
+            coords = f"{st.session_state.lat}, {st.session_state.lng}"
+            st.code(f"https://maps.google.com/?q={coords}", language="text")
+            st.code(coords, language="text")
 
     st.subheader("แนบภาพภารกิจ (ทางเลือก)")
     img = st.file_uploader("อัปโหลดภาพ (jpg/png)", type=["jpg","jpeg","png"], key="imgu")
@@ -483,17 +588,102 @@ with colL:
             st.error(f"แสดงภาพไม่สำเร็จ: {e}")
 
 with colR:
-    st.subheader("แผนที่")
+    st.subheader("แผนที่ (Google Maps)")
     if st.session_state.lat:
-        m = folium.Map(location=[st.session_state.lat, st.session_state.lng], zoom_start=15)
-        folium.Marker(
-            location=[st.session_state.lat, st.session_state.lng],
-            popup=f"📍 {st.session_state.address}",
-            tooltip=st.session_state.fixed_input or st.session_state.get(INPUT_WIDGET_KEY, "")
-        ).add_to(m)
-        if st_folium:
-            st_folium(m, width=720, height=520)
+        all_locs = st.session_state.get("all_locations", [])
+        gmaps_key = load_google_maps_key()
+        
+        if not gmaps_key:
+            st.warning("⚠️ ไม่มี Google Maps API key - กำลังใช้แผนที่ทดแทน")
+            # fallback ใช้ Folium
+            m = folium.Map(location=[st.session_state.lat, st.session_state.lng], zoom_start=10)
+            for idx, loc_data in enumerate(all_locs, 1):
+                folium.Marker(
+                    location=[loc_data["lat"], loc_data["lng"]],
+                    popup=f"📍 {loc_data['name']}<br>{loc_data['lat']:.6f}, {loc_data['lng']:.6f}",
+                    tooltip=f"{idx}. {loc_data['name']}",
+                    icon=folium.Icon(color="red" if idx == 1 else "blue", icon="info-sign")
+                ).add_to(m)
+            
+            # วาดเส้นเชื่อม
+            if len(all_locs) > 1:
+                coords = [[loc["lat"], loc["lng"]] for loc in all_locs]
+                folium.PolyLine(coords, color="red", weight=3, opacity=0.7).add_to(m)
+            
+            if st_folium:
+                st_folium(m, width=720, height=520)
         else:
-            st.warning("ไม่ได้ติดตั้ง streamlit-folium: ติดตั้งเพื่อ render แผนที่ในแอป")
+            # ใช้ Google Maps
+            if len(all_locs) == 1:
+                center_lat = all_locs[0]["lat"]
+                center_lng = all_locs[0]["lng"]
+                zoom = 15
+            else:
+                # หาจุดกึ่งกลาง
+                center_lat = sum([loc["lat"] for loc in all_locs]) / len(all_locs)
+                center_lng = sum([loc["lng"] for loc in all_locs]) / len(all_locs)
+                zoom = 10
+            
+            # สร้าง markers string
+            markers_js = ""
+            for idx, loc_data in enumerate(all_locs, 1):
+                label = idx
+                markers_js += f"""
+                new google.maps.Marker({{
+                    position: {{lat: {loc_data['lat']}, lng: {loc_data['lng']}}},
+                    map: map,
+                    label: '{label}',
+                    title: '{loc_data['name']}'
+                }});
+                """
+            
+            # สร้าง polyline (เส้นเชื่อม)
+            polyline_js = ""
+            if len(all_locs) > 1:
+                coords_str = ",".join([f"{{lat: {loc['lat']}, lng: {loc['lng']}}}" for loc in all_locs])
+                polyline_js = f"""
+                const flightPath = new google.maps.Polyline({{
+                    path: [{coords_str}],
+                    geodesic: true,
+                    strokeColor: "#FF0000",
+                    strokeOpacity: 1.0,
+                    strokeWeight: 3,
+                }});
+                flightPath.setMap(map);
+                """
+            
+            # Google Maps HTML
+            map_html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <style>
+                    #map {{
+                        height: 520px;
+                        width: 100%;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div id="map"></div>
+                <script>
+                    function initMap() {{
+                        const map = new google.maps.Map(document.getElementById("map"), {{
+                            zoom: {zoom},
+                            center: {{lat: {center_lat}, lng: {center_lng}}},
+                        }});
+                        
+                        {markers_js}
+                        {polyline_js}
+                    }}
+                </script>
+                <script async defer
+                    src="https://maps.googleapis.com/maps/api/js?key={gmaps_key}&callback=initMap">
+                </script>
+            </body>
+            </html>
+            """
+            
+            st.components.v1.html(map_html, height=550)
     else:
         st.info("พิมพ์หรือพูดชื่อสถานที่ แล้วกดค้นหา เพื่อให้แผนที่ปรากฏ")
