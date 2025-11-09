@@ -8,3 +8,4 @@ openai
 audio-recorder-streamlit
 pythainlp
 python-dotenv
+requests

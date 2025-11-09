@@ -300,58 +300,58 @@ def _normalize_text(t: str) -> str:
 # =========================
 # Extract & Fuzzy (ไม่ลดความเฉพาะเจาะจง)
 # =========================
+def smart_split_locations(text: str):
+    """
+    แยกสถานที่อย่างฉลาดจากประโยค
+    เช่น: "บินจากสุวรรณภูมิไปเชียงใหม่แล้วไปภูเก็ต"
+    -> ["สุวรรณภูมิ", "เชียงใหม่", "ภูเก็ต"]
+    """
+    if not text:
+        return []
+    
+    text = postprocess_text(text)
+    
+    # ลบคำที่ไม่เกี่ยวข้อง
+    noise_words = ["บิน", "เดิน", "วิ่ง", "ขับ", "โดรน", "ลง", "ขึ้น", "ก่อน", "หลัง", "หลังจาก"]
+    
+    # Split ด้วยคำสำคัญ
+    splitters = r'(จาก|ไป|ไปยัง|แล้ว|จากนั้น|หลังจากนั้น|ผ่าน|ถึง|มาที่|มาถึง)'
+    parts = re.split(splitters, text)
+    
+    locations = []
+    for part in parts:
+        part = part.strip()
+        if not part or part in ["จาก", "ไป", "ไปยัง", "แล้ว", "จากนั้น", "หลังจากนั้น", "ผ่าน", "ถึง", "มาที่", "มาถึง"]:
+            continue
+        
+        # ลบ noise words
+        for noise in noise_words:
+            part = part.replace(noise, " ")
+        
+        part = part.strip()
+        
+        # เกณฑ์: ความยาวขั้นต่ำ 2 ตัวอักษรไทย (ไม่นับตัวเลข)
+        if len(part) >= 2 and any('฀' <= c <= '๿' for c in part):
+            locations.append(part)
+    
+    return list(dict.fromkeys(locations))  # ลบซ้ำ
+
 def extract_location_from_text(text: str, return_all=False):
     """
-    แกะสถานที่จากประโยค
+    แกะสถานที่จากประโยค (ใช้ smart split แทน)
     return_all=True: คืนค่าทุกสถานที่ที่เจอ (สำหรับจำลองโดรนหลายจุด)
     return_all=False: คืนค่าอันเดียว (เดิม)
     """
-    if not text: return []
-    text_norm = _normalize_text(text)
-    out = []
-
-    # 1) match ตรงตัวจากคลังชื่อ
-    for loc in get_places():
-        if _normalize_text(loc) in text_norm:
-            out.append(loc)
-
-    # 2) regex จับวลีสถานที่
-    pats = [
-        r'(มหาวิทยาลัย[\u0e00-\u0e7f\s]+)',
-        r'(ท่าอากาศยาน[\u0e00-\u0e7f\s]+)',
-        r'(สนามบิน[\u0e00-\u0e7f\s]+)',
-        r'(อนุสาวรีย์[\u0e00-\u0e7f\s]+)',
-        r'(วัด[\u0e00-\u0e7f\s]+)',
-        r'(โรงพยาบาล[\u0e00-\u0e7f\s]+)',
-        r'(จังหวัด[\u0e00-\u0e7f\s]+)',
-        r'(สถานี[\u0e00-\u0e7f\s]+)',
-        r'(BTS [\u0e00-\u0e7f\w\s]+)',
-        r'(MRT [\u0e00-\u0e7f\w\s]+)',
-    ]
-    for p in pats:
-        for m in re.findall(p, text_norm, re.UNICODE):
-            m = m.strip()
-            if len(m) > 3:
-                out.append(m)
-
-    # 3) pythainlp (optional)
-    if PYTHAINLP_AVAILABLE:
-        try:
-            words = word_tokenize(text_norm, engine="newmm")
-            for i, w in enumerate(words):
-                if w in ['มหาวิทยาลัย','สนามบิน','วัด','โรงพยาบาล','อนุสาวรีย์'] and i+1 < len(words):
-                    cand = (w + words[i+1]).strip()
-                    if len(cand) > 4:
-                        out.append(cand)
-        except Exception:
-            pass
-
-    result = list(dict.fromkeys(out))  # ลบซ้ำแต่เก็บลำดับ
+    if not text:
+        return []
+    
+    # ใช้ smart split เป็นหลัก
+    result = smart_split_locations(text)
     
     if return_all:
-        return result  # คืนทั้งหมด
+        return result
     else:
-        return result  # คืนทั้งหมด (แต่เดิมจะเอาแค่อันเดียว ตอนนี้ปล่อยให้ caller จัดการ)
+        return result
 
 def _restrict_by_tag(candidates, required_tag):
     req = "มหาวิทยาลัย" if required_tag in ["มหาวิทยาลัย","มหาลัย"] else required_tag
@@ -404,19 +404,71 @@ def correct_location(user_text: str, threshold: int = THRESHOLD):
 # =========================
 # Geocoding
 # =========================
-def geocode_location(q: str):
+def geocode_location_google(q: str, api_key: str = None):
+    """
+    ใช้ Google Maps Geocoding API โดยตรง
+    """
     q = (q or "").strip()
-    if not q: return None
-    geolocator_arcgis = ArcGIS(user_agent="arcgis_fuzzy_app")
-    geolocator_nominatim = Nominatim(user_agent="nominatim_fuzzy_app")
-    try:
-        loc = geolocator_arcgis.geocode(q, timeout=10)
-        if not loc:
-            loc = geolocator_nominatim.geocode(q, timeout=10)
-        return loc
-    except Exception as e:
-        st.error(f"🚨 API geocoding ล้มเหลว: {e}")
+    if not q:
         return None
+    
+    if not api_key:
+        api_key = load_google_maps_key()
+    
+    if not api_key:
+        # Fallback ไปใช้ Nominatim
+        try:
+            geolocator = Nominatim(user_agent="drone_geocoding_app")
+            return geolocator.geocode(q, timeout=10)
+        except Exception:
+            return None
+    
+    # ใช้ Google Geocoding API
+    try:
+        import requests
+        url = "https://maps.googleapis.com/maps/api/geocode/json"
+        params = {
+            "address": q,
+            "key": api_key,
+            "region": "th",  # บอกให้หาในไทยเป็นหลัก
+            "language": "th"
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        
+        if data.get("status") == "OK" and data.get("results"):
+            result = data["results"][0]
+            location = result["geometry"]["location"]
+            
+            # สร้าง object คล้าย geopy location
+            class GoogleLocation:
+                def __init__(self, lat, lng, address):
+                    self.latitude = lat
+                    self.longitude = lng
+                    self.address = address
+            
+            return GoogleLocation(
+                location["lat"],
+                location["lng"],
+                result.get("formatted_address", q)
+            )
+        
+        return None
+    
+    except Exception as e:
+        # Fallback ไปใช้ Nominatim
+        try:
+            geolocator = Nominatim(user_agent="drone_geocoding_app")
+            return geolocator.geocode(q, timeout=10)
+        except Exception:
+            return None
+
+def geocode_location(q: str):
+    """
+    Wrapper เดิมเพื่อ backward compatibility
+    """
+    return geocode_location_google(q)
 
 
 # =========================
@@ -539,31 +591,28 @@ with colL:
         if not extracted_places:
             extracted_places = [q_orig]
         
+        st.info(f"🔍 พบ {len(extracted_places)} คำที่น่าจะเป็นสถานที่: {', '.join([f'\"**{p}**\"' for p in extracted_places])}")
+        
         all_results = []
+        failed_places = []
         
-        for place_text in extracted_places:
-            # ลอง geocode ด้วยคำเดิมก่อน
-            loc = geocode_location(place_text)
-            used_name = place_text
-            corrected = False
-            
-            if not loc:
-                # ลอง correct
-                cand, score = correct_location(place_text, threshold=THRESHOLD)
-                if cand:
-                    loc = geocode_location(cand)
-                    used_name = cand
-                    corrected = True
-            
-            if loc:
-                all_results.append({
-                    "name": used_name,
-                    "lat": loc.latitude,
-                    "lng": loc.longitude,
-                    "address": loc.address,
-                    "corrected": corrected
-                })
+        with st.spinner("📍 กำลังค้นหาพิกัดจาก Google Maps..."):
+            for place_text in extracted_places:
+                # ลอง geocode โดยตรงด้วย Google
+                loc = geocode_location(place_text)
+                
+                if loc:
+                    all_results.append({
+                        "name": place_text,
+                        "lat": loc.latitude,
+                        "lng": loc.longitude,
+                        "address": loc.address,
+                        "original_query": place_text
+                    })
+                else:
+                    failed_places.append(place_text)
         
+        # แสดงผลลัพธ์อย่างละเอียด
         if all_results:
             st.session_state.all_locations = all_results
             # เก็บสถานที่แรกใน state เดิม (backward compatible)
@@ -572,18 +621,15 @@ with colL:
             st.session_state.address = all_results[0]["address"]
             st.session_state.fixed_input = all_results[0]["name"]
             
-            if len(all_results) == 1:
-                if all_results[0]["corrected"]:
-                    st.success(f"✅ พบพิกัด (หลังแก้คำ): **{all_results[0]['name']}**")
-                else:
-                    st.success("✅ พบพิกัดจากข้อความเดิม")
-            else:
-                st.success(f"✅ พบ {len(all_results)} สถานที่จากประโยค")
+            st.success(f"✅ พบพิกัดสำเร็จ: **{len(all_results)}/{len(extracted_places)}** สถานที่")
+            
+            if failed_places:
+                st.warning(f"⚠️ ไม่พบพิกัด: {', '.join([f'\"**{p}**\"' for p in failed_places])}")
         else:
             st.session_state.lat = st.session_state.lng = None
             st.session_state.address = None
             st.session_state.all_locations = []
-            st.warning("ไม่พบพิกัดที่ตรงเงื่อนไข")
+            st.error(f"❌ ไม่พบพิกัดทั้งหมด {len(extracted_places)} สถานที่: {', '.join([f'\"**{p}**\"' for p in extracted_places])}")
 
     if st.session_state.lat:
         st.subheader("ผลลัพธ์")
