@@ -28,9 +28,9 @@ from openai import OpenAI
 # =========================
 # App config
 # =========================
-st.set_page_config(page_title="Fuzzy Geocoding + Typhoon ASR", layout="wide", page_icon="🗺️")
+st.set_page_config(page_title="Drone Geocoding App", layout="wide", page_icon="🗺️")
 
-APP_TITLE   = "🗺️ Fuzzy Geocoding + Typhoon ASR"
+APP_TITLE   = "🗺️ Drone Geocoding App"
 THRESHOLD   = 78  # เข้มขึ้น ลดการแก้คำมั่ว
 STRICT_TAGS = ["มหาวิทยาลัย","มหาลัย","สนามบิน","ท่าอากาศยาน","วัด","โรงพยาบาล","อนุสาวรีย์","สถานี","BTS","MRT"]
 
