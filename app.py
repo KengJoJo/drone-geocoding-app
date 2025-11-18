@@ -1,54 +1,33 @@
 # app.py
-import os, re, io, tempfile, importlib, pathlib
+import os, re, tempfile, importlib, pathlib
+import requests
 import streamlit as st
-from PIL import Image
-
-# Geocoding & fuzzy
-from geopy.geocoders import ArcGIS, Nominatim
-from rapidfuzz import process as rf_process, fuzz as rf_fuzz
-
-# Map
-import folium
-try:
-    from streamlit_folium import st_folium
-except Exception:
-    st_folium = None
-
-# Thai NLP (optional)
-try:
-    from pythainlp.tokenize import word_tokenize
-    PYTHAINLP_AVAILABLE = True
-except Exception:
-    PYTHAINLP_AVAILABLE = False
-
-# OpenAI-compatible client (Typhoon API)
 from openai import OpenAI
-
 
 # =========================
 # App config
 # =========================
-st.set_page_config(page_title="Drone Geocoding App", layout="wide", page_icon="🗺️")
+st.set_page_config(page_title="Drone Geocoding (Audio + Multi-waypoint)", layout="wide", page_icon="🗺️")
 
-APP_TITLE   = "🗺️ Drone Geocoding App"
-THRESHOLD   = 78  # เข้มขึ้น ลดการแก้คำมั่ว
-STRICT_TAGS = ["มหาวิทยาลัย","มหาลัย","สนามบิน","ท่าอากาศยาน","วัด","โรงพยาบาล","อนุสาวรีย์","สถานี","BTS","MRT"]
-
-# widget keys / temp states (สำคัญ: แยก key ของ widget ออกจากค่าที่เราจะอัปเดตเอง)
-INPUT_WIDGET_KEY = "raw_input_widget"
-TRANSCRIBED_KEY  = "transcribed_text"
-
-# init state
-if "lat" not in st.session_state:
-    st.session_state.update(dict(lat=None, lng=None, address=None, fixed_input=""))
-if TRANSCRIBED_KEY not in st.session_state:
-    st.session_state[TRANSCRIBED_KEY] = ""
-if "all_locations" not in st.session_state:
-    st.session_state["all_locations"] = []  # เก็บ [{"name": str, "lat": float, "lng": float, "address": str}]
-
+APP_TITLE = "🗺️ Drone Geocoding (Audio → Multi-point Google Maps)"
 
 # =========================
-# โหลดคีย์จาก ENV/ไฟล์ 3 ตัว
+# Init session state (ใช้ track state หลายจุด)
+# =========================
+if "lat" not in st.session_state:
+    st.session_state.lat = None
+if "lng" not in st.session_state:
+    st.session_state.lng = None
+if "address" not in st.session_state:
+    st.session_state.address = None
+if "transcript" not in st.session_state:
+    st.session_state.transcript = ""
+if "all_locations" not in st.session_state:
+    # [{"index": 1, "text": "...", "place_text": "...", "lat": ..., "lng": ..., "address": "...", "raw_json": {...}}, ...]
+    st.session_state.all_locations = []
+
+# =========================
+# Small helpers
 # =========================
 def _extract_by_regex(text: str, patterns):
     for pat in patterns:
@@ -59,30 +38,28 @@ def _extract_by_regex(text: str, patterns):
 
 def load_google_maps_key():
     """
-    โหลด Google Maps API key จาก Streamlit Secrets, ENV, หรือไฟล์
-    คืนค่า: api_key (str หรือ None)
+    โหลด Google Maps API key จาก Streamlit Secrets หรือ ENV หรือไฟล์
     """
-    # 1) Streamlit Secrets (highest priority)
+    # 1) Streamlit Secrets
     try:
         key = st.secrets.get("GOOGLE_MAPS_API_KEY") or st.secrets.get("GOOGLE_API_KEY")
         if key:
             return key
     except Exception:
         pass
-    
+
     # 2) ENV
     key = os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if key:
         return key
-    
-    # 3) ไฟล์ config (legacy, not recommended)
+
+    # 3) หาในไฟล์เก่า ๆ (optional)
     root = pathlib.Path(__file__).parent
     candidate_files = ["api_transcribe.py", "typhoon_rt_toggle.py", "1.PY", "config.py"]
     key_pats = [
         r'GOOGLE_MAPS_API_KEY\s*=\s*[\'"]([^\'"]+)[\'"]',
         r'GOOGLE_API_KEY\s*=\s*[\'"]([^\'"]+)[\'"]',
     ]
-    
     for fname in candidate_files:
         p = root / fname
         if not p.exists():
@@ -94,15 +71,11 @@ def load_google_maps_key():
                 return key
         except Exception:
             pass
-    
     return None
 
 def load_typhoon_config_from_files():
     """
-    ไล่หา key/base/model จากไฟล์ใน repo:
-    - import module ถ้าไฟล์ import ได้ (api_transcribe, typhoon_rt_toggle)
-    - อ่านไฟล์ดิบด้วย regex (รวม 1.PY)
-    คืนค่า: (api_key, base_url, model) (อันไหนหาไม่เจอเป็น None)
+    ไล่หา key/base/model ของ Typhoon/OpenAI จากไฟล์ใน repo
     """
     root = pathlib.Path(__file__).parent
     candidate_modules = ["api_transcribe", "typhoon_rt_toggle"]
@@ -122,7 +95,7 @@ def load_typhoon_config_from_files():
     if key and base and model:
         return key, base, model
 
-    # 2) regex from raw files (incl. 1.PY)
+    # 2) regex from raw files
     key_pats = [
         r'API_KEY\s*=\s*[\'"]([^\'"]+)[\'"]',
         r'OPENTYPHOON_API_KEY\s*=\s*[\'"]([^\'"]+)[\'"]',
@@ -153,10 +126,10 @@ def load_typhoon_config_from_files():
 
 def make_client():
     """
-    ลำดับการหา config:
-    1) Streamlit Secrets (highest priority)
-    2) ENV/Secrets
-    3) ดึงจากไฟล์: api_transcribe.py, typhoon_rt_toggle.py, 1.PY
+    หา config Typhoon ASR:
+    1) Streamlit Secrets
+    2) ENV
+    3) ไฟล์ใน repo
     """
     # 1) Streamlit Secrets
     try:
@@ -165,7 +138,7 @@ def make_client():
         model = st.secrets.get("TYPHOON_MODEL")
     except Exception:
         key = base = model = None
-    
+
     # 2) ENV
     if not key:
         key = os.getenv("OPENTYPHOON_API_KEY") or os.getenv("OPENAI_API_KEY")
@@ -174,20 +147,95 @@ def make_client():
     if not model:
         model = os.getenv("TYPHOON_MODEL")
 
+    # 3) ไฟล์
     if not (key and base and model):
         f_key, f_base, f_model = load_typhoon_config_from_files()
         key   = key   or f_key
         base  = base  or f_base
         model = model or f_model
 
-    # ดีฟอลต์เมื่อไฟล์ไม่ได้กำหนด
     base  = base  or "https://api.opentyphoon.ai/v1"
     model = model or "typhoon-asr-realtime"
 
     if not key:
-        raise RuntimeError("ไม่พบ API Key ทั้งใน ENV และไฟล์ (api_transcribe.py / typhoon_rt_toggle.py / 1.PY)")
+        raise RuntimeError("ไม่พบ API Key ของ Typhoon/OpenAI")
+
     return OpenAI(api_key=key, base_url=base), model
 
+def postprocess_text(text: str) -> str:
+    if not text:
+        return ""
+    x = re.sub(r'\s+', ' ', text).strip()
+    x = re.sub(r'(?<=[ก-๛A-Za-z])(?=\d)', ' ', x)
+    x = re.sub(r'(?<=\d)(?=[ก-๛A-Za-z])', ' ', x)
+    return x
+
+# =========================
+# แยกสถานที่จากประโยค (smart split)
+# =========================
+def smart_split_locations(text: str):
+    """
+    แยกสถานที่อย่างง่ายจากประโยค
+    เช่น: "เริ่มบินจากโลตัสปทุมธานี ไปที่ ฟิวเจอร์รังสิตแล้วจอดที่กรุงเทพ"
+    -> ["โลตัสปทุมธานี", "ฟิวเจอร์รังสิต", "กรุงเทพ"]
+    """
+    if not text:
+        return []
+
+    text = postprocess_text(text)
+
+    # คำที่ใช้แบ่ง segment
+    splitters = r'(จาก|ไปที่|ไปยัง|ไป|แล้ว|แล้วจอดที่|จอดที่|ถึง|มาที่|มาถึง|จากนั้น|หลังจากนั้น)'
+    parts = re.split(splitters, text)
+
+    noise_words = ["เริ่มบิน", "เริ่ม", "บิน", "โดรน", "ขับ", "เดินทาง", "ก่อน", "หลัง", "ต่อไป", "ต่อ"]
+
+    locations = []
+    buf = ""
+
+    for part in parts:
+        part = (part or "").strip()
+        if not part:
+            continue
+
+        # ถ้าเป็น splitter ให้ตัด buffer เดิมขึ้นมาเป็น location (ถ้ามี)
+        if part in ["จาก", "ไปที่", "ไปยัง", "ไป", "แล้ว", "แล้วจอดที่", "จอดที่", "ถึง", "มาที่", "มาถึง", "จากนั้น", "หลังจากนั้น"]:
+            if buf.strip():
+                locations.append(buf.strip())
+            buf = ""
+            continue
+
+        # ลบ noise
+        for n in noise_words:
+            part = part.replace(n, " ")
+
+        buf = (buf + " " + part).strip()
+
+    if buf.strip():
+        locations.append(buf.strip())
+
+    # filter ง่าย ๆ: ต้องมีตัวอักษรไทย/อังกฤษอย่างน้อย 2 ตัว
+    cleaned = []
+    for loc in locations:
+        loc = " ".join(loc.split())
+        if len(loc) >= 2 and any("ก" <= c <= "๛" or c.isalpha() for c in loc):
+            cleaned.append(loc)
+
+    # unique & preserve order
+    seen = set()
+    result = []
+    for loc in cleaned:
+        if loc not in seen:
+            seen.add(loc)
+            result.append(loc)
+    return result
+
+def extract_location_from_text(text: str):
+    """
+    คืนรายการสถานที่ทั้งหมดที่แยกได้จากประโยค
+    ถ้าไม่เจอเลย → คืน list ว่าง
+    """
+    return smart_split_locations(text)
 
 # =========================
 # ASR
@@ -203,341 +251,111 @@ def typhoon_transcribe(audio_bytes: bytes, file_ext: str = ".wav") -> str:
         text = getattr(resp, "text", None)
         return postprocess_text((text or "").strip())
     finally:
-        try: os.unlink(tmp_path)
-        except Exception: pass
-
-
-# =========================
-# Text post-process
-# =========================
-_UNIT_WORDS = r'(เมตร|ม\.|กิโลเมตร|กม\.|เซนติเมตร|ซม\.|มิลลิเมตร|มม\.|วินาที|นาที|ชั่วโมง|องศา|%)'
-def postprocess_text(text: str) -> str:
-    if not text: return ""
-    x = re.sub(r'\s+', ' ', text).strip()
-    x = re.sub(r'(\d)\s*' + _UNIT_WORDS, r'\1 \2', x)
-    x = re.sub(r'(?<=[ก-๛A-Za-z])(?=\d)', ' ', x)
-    x = re.sub(r'(?<=\d)(?=[ก-๛A-Za-z])', ' ', x)
-    # normalize คำเรียก
-    x = x.replace("สุวรณภูมิ", "สุวรรณภูมิ")
-    x = x.replace("มหาลัย","มหาวิทยาลัย")
-    return x
-
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
 # =========================
-# Place list (built-in + optional txt)
-# =========================
-BUILTIN_LOCATIONS = [
-    # มหาวิทยาลัย (ตัวอย่างหลัก ๆ)
-    "มหาวิทยาลัยเทคโนโลยีพระจอมเกล้าพระนครเหนือ",
-    "มหาวิทยาลัยเกษตรศาสตร์",
-    "จุฬาลงกรณ์มหาวิทยาลัย",
-    "มหาวิทยาลัยมหิดล",
-    "มหาวิทยาลัยธรรมศาสตร์",
-    "มหาวิทยาลัยรามคำแหง",
-    "มหาวิทยาลัยศรีนครินทรวิโรฒ",
-    "มหาวิทยาลัยกรุงเทพ",
-    "มหาวิทยาลัยเชียงใหม่",
-    "มหาวิทยาลัยขอนแก่น",
-    "มหาวิทยาลัยบูรพา",
-    "มหาวิทยาลัยสงขลานครินทร์",
-    "มหาวิทยาลัยนเรศวร",
-    "มหาวิทยาลัยศิลปากร",
-    "มหาวิทยาลัยเทคโนโลยีสุรนารี",
-    "มหาวิทยาลัยแม่ฟ้าหลวง",
-    "มหาวิทยาลัยมหาสารคาม",
-    "มหาวิทยาลัยปทุมธานี",
-    # แลนด์มาร์ก/รพ./สนามบิน
-    "ท่าอากาศยานสุวรรณภูมิ",
-    "ท่าอากาศยานดอนเมือง",
-    "สนามบินสุวรรณภูมิ",
-    "สนามบินดอนเมือง",
-    "สุวรรณภูมิ",  # เพิ่มชื่อเดี่ยว
-    "ดอนเมือง",
-    "อนุสาวรีย์ชัยสมรภูมิ",
-    "วัดพระแก้ว",
-    "วัดอรุณ",
-    "พระบรมมหาราชวัง",
-    "สยามพารากอน",
-    "เซ็นทรัลเวิลด์",
-    "โรงพยาบาลศิริราช",
-    "โรงพยาบาลรามาธิบดี",
-    "โรงพยาบาลจุฬาลงกรณ์",
-    # จังหวัด/เมืองสำคัญ
-    "จังหวัดเชียงใหม่","เชียงใหม่",
-    "จังหวัดภูเก็ต","ภูเก็ต",
-    "จังหวัดปทุมธานี","ปทุมธานี",
-    "จังหวัดนนทบุรี","นนทบุรี",
-    "จังหวัดชลบุรี","ชลบุรี","พัทยา",
-    "จังหวัดขอนแก่น","ขอนแก่น",
-    "จังหวัดนครราชสีมา","นครราชสีมา","โคราช",
-    "จังหวัดสงขลา","หาดใหญ่",
-    "จังหวัดกระบี่","กระบี่",
-    "กรุงเทพ","กรุงเทพมหานคร","Bangkok"
-]
-
-def load_places_from_txt(filename="th_places.txt"):
-    try:
-        if os.path.exists(filename):
-            with open(filename, "r", encoding="utf-8") as f:
-                lines = [l.strip() for l in f if l.strip()]
-            return list(dict.fromkeys(BUILTIN_LOCATIONS + lines))
-    except Exception:
-        pass
-    return BUILTIN_LOCATIONS
-
-BASE_PLACES = load_places_from_txt()
-if "ALL_PLACES" not in st.session_state:
-    st.session_state.ALL_PLACES = BASE_PLACES
-
-def get_places():
-    return st.session_state.get("ALL_PLACES", BASE_PLACES)
-
-def _normalize_text(t: str) -> str:
-    t = (t or "").strip().lower()
-    return " ".join(t.split())
-
-
-# =========================
-# Extract & Fuzzy (ไม่ลดความเฉพาะเจาะจง)
-# =========================
-def smart_split_locations(text: str):
-    """
-    แยกสถานที่อย่างฉลาดจากประโยค
-    เช่น: "บินจากสุวรรณภูมิไปเชียงใหม่แล้วไปภูเก็ต"
-    -> ["สุวรรณภูมิ", "เชียงใหม่", "ภูเก็ต"]
-    """
-    if not text:
-        return []
-    
-    text = postprocess_text(text)
-    
-    # ลบคำที่ไม่เกี่ยวข้อง
-    noise_words = ["บิน", "เดิน", "วิ่ง", "ขับ", "โดรน", "ลง", "ขึ้น", "ก่อน", "หลัง", "หลังจาก"]
-    
-    # Split ด้วยคำสำคัญ
-    splitters = r'(จาก|ไป|ไปยัง|แล้ว|จากนั้น|หลังจากนั้น|ผ่าน|ถึง|มาที่|มาถึง)'
-    parts = re.split(splitters, text)
-    
-    locations = []
-    for part in parts:
-        part = part.strip()
-        if not part or part in ["จาก", "ไป", "ไปยัง", "แล้ว", "จากนั้น", "หลังจากนั้น", "ผ่าน", "ถึง", "มาที่", "มาถึง"]:
-            continue
-        
-        # ลบ noise words
-        for noise in noise_words:
-            part = part.replace(noise, " ")
-        
-        part = part.strip()
-        
-        # เกณฑ์: ความยาวขั้นต่ำ 2 ตัวอักษรไทย (ไม่นับตัวเลข)
-        if len(part) >= 2 and any('฀' <= c <= '๿' for c in part):
-            locations.append(part)
-    
-    return list(dict.fromkeys(locations))  # ลบซ้ำ
-
-def extract_location_from_text(text: str, return_all=False):
-    """
-    แกะสถานที่จากประโยค (ใช้ smart split แทน)
-    return_all=True: คืนค่าทุกสถานที่ที่เจอ (สำหรับจำลองโดรนหลายจุด)
-    return_all=False: คืนค่าอันเดียว (เดิม)
-    """
-    if not text:
-        return []
-    
-    # ใช้ smart split เป็นหลัก
-    result = smart_split_locations(text)
-    
-    if return_all:
-        return result
-    else:
-        return result
-
-def _restrict_by_tag(candidates, required_tag):
-    req = "มหาวิทยาลัย" if required_tag in ["มหาวิทยาลัย","มหาลัย"] else required_tag
-    return [c for c in candidates if req in c]
-
-def fuzzy_best(user_text: str, threshold=THRESHOLD, query_override=None):
-    """
-    query_override: ถ้าส่งมา จะใช้ค่านี้แทนการ extract จาก user_text
-    """
-    user_text = postprocess_text(user_text)
-    required_tag = next((t for t in STRICT_TAGS if t in user_text), None)
-
-    if query_override:
-        query = query_override
-    else:
-        extracted = extract_location_from_text(user_text, return_all=False)
-        if extracted:
-            extracted = sorted(extracted, key=len, reverse=True)  # เอาอันยาวสุด (specific)
-        query = extracted[0] if extracted else user_text
-    
-    query_norm = _normalize_text(query)
-    if not query_norm:
-        return None, 0
-
-    candidates = get_places()
-    if required_tag:
-        tagged = _restrict_by_tag(candidates, required_tag)
-        if tagged:
-            candidates = tagged
-
-    res = rf_process.extractOne(query_norm, candidates, scorer=rf_fuzz.token_set_ratio)
-    if not res:
-        return None, 0
-    name, score, _ = res
-
-    # ไม่ยอมลดความเฉพาะ: ถ้าคำค้นมี "มหาวิทยาลัย" แต่คำตอบไม่มี → ไม่รับ
-    if ("มหาวิทยาลัย" in query and "มหาวิทยาลัย" not in name):
-        return None, int(score)
-    # ถ้าระบุ tag แล้วแต่ผลไม่มี tag นั้น → ไม่รับ
-    if required_tag and required_tag not in name:
-        return None, int(score)
-
-    return (name, int(score)) if score >= threshold else (None, int(score))
-
-def correct_location(user_text: str, threshold: int = THRESHOLD):
-    best, score = fuzzy_best(user_text, threshold=threshold)
-    return best if best else None, score
-
-
-# =========================
-# Geocoding
+# Geocoding (Google + JSON)
 # =========================
 def geocode_location_google(q: str, api_key: str = None):
     """
-    ใช้ Google Maps Geocoding API โดยตรง
+    เรียก Google Geocoding API แล้วคืน:
+    - (lat, lng, formatted_address)
+    - raw JSON (dict) สำหรับแสดงในหน้าเว็บ
     """
     q = (q or "").strip()
     if not q:
-        return None
-    
+        return None, None
+
     if not api_key:
         api_key = load_google_maps_key()
-    
+
     if not api_key:
-        # Fallback ไปใช้ Nominatim
-        try:
-            geolocator = Nominatim(user_agent="drone_geocoding_app")
-            return geolocator.geocode(q, timeout=10)
-        except Exception:
-            return None
-    
-    # ใช้ Google Geocoding API
+        return None, {"error": "NO_GOOGLE_API_KEY"}
+
     try:
-        import requests
         url = "https://maps.googleapis.com/maps/api/geocode/json"
         params = {
             "address": q,
             "key": api_key,
-            "region": "th",  # บอกให้หาในไทยเป็นหลัก
+            "region": "th",
             "language": "th"
         }
-        
         response = requests.get(url, params=params, timeout=10)
         data = response.json()
-        
+
         if data.get("status") == "OK" and data.get("results"):
             result = data["results"][0]
             location = result["geometry"]["location"]
-            
-            # สร้าง object คล้าย geopy location
-            class GoogleLocation:
-                def __init__(self, lat, lng, address):
-                    self.latitude = lat
-                    self.longitude = lng
-                    self.address = address
-            
-            return GoogleLocation(
-                location["lat"],
-                location["lng"],
-                result.get("formatted_address", q)
-            )
-        
-        return None
-    
+            lat = location["lat"]
+            lng = location["lng"]
+            address = result.get("formatted_address", q)
+            return (lat, lng, address), data
+
+        return None, data
+
     except Exception as e:
-        # Fallback ไปใช้ Nominatim
-        try:
-            geolocator = Nominatim(user_agent="drone_geocoding_app")
-            return geolocator.geocode(q, timeout=10)
-        except Exception:
-            return None
-
-def geocode_location(q: str):
-    """
-    Wrapper เดิมเพื่อ backward compatibility
-    """
-    return geocode_location_google(q)
-
+        return None, {"error": str(e)}
 
 # =========================
 # UI
 # =========================
-st.markdown("""
+st.markdown(
+    """
 <style>
 .block-container {padding-top: 1.2rem; padding-bottom: 1rem;}
-.card { border: 1px solid rgba(0,0,0,.08); border-radius: 16px; padding: 1rem 1rem; background: rgba(255,255,255,.06);
+.card { border: 1px solid rgba(0,0,0,.08); border-radius: 16px;
+        padding: 1rem 1rem; background: rgba(255,255,255,.06);
         box-shadow: 0 8px 30px rgba(0,0,0,.08); }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 st.title(APP_TITLE)
-st.caption("พิมพ์/พูด เพื่อหา “พิกัดจริง” ของสถานที่ในไทย (รองรับสะกดเพี้ยน) • Typhoon ASR API")
+st.caption("อัดเสียงประโยคเดียว เช่น “เริ่มบินจากโลตัสปทุมธานี ไปฟิวเจอร์รังสิตแล้วจอดที่กรุงเทพ” → แยกหลายสถานที่ → Google Geocoding → แผนที่")
 
 with st.sidebar:
-    st.header("ตั้งค่า")
-    
-    # Typhoon ASR status
+    st.header("สถานะ API")
+
+    # Typhoon ASR
     api_info = st.empty()
     try:
         _client, _model = make_client()
         api_info.success(f"✅ Typhoon ASR ready • model: `{_model}`")
     except Exception as e:
-        api_info.error(f"❌ API not ready: {e}")
-    
-    # Google Maps API status
+        api_info.error(f"❌ Typhoon ASR ใช้งานไม่ได้: {e}")
+
+    # Google Maps API
     gmaps_info = st.empty()
     gmaps_key = load_google_maps_key()
     if gmaps_key:
         masked_key = gmaps_key[:10] + "***" + gmaps_key[-4:] if len(gmaps_key) > 14 else "***"
         gmaps_info.success(f"✅ Google Maps API ready • key: `{masked_key}`")
     else:
-        gmaps_info.warning("⚠️ Google Maps API key not configured")
+        gmaps_info.warning("⚠️ ยังไม่ได้ตั้งค่า Google Maps API key")
 
-    st.divider()
-    st.write("**ไฟล์รายชื่อสถานที่**")
-    st.caption("อัปโหลด `th_places.txt` (ชื่อสถานที่บรรทัดละหนึ่งชื่อ) เพื่อเสริมคลัง")
-    place_file = st.file_uploader("อัปโหลด .txt", type=["txt"], label_visibility="collapsed")
-    if place_file:
-        try:
-            txt = place_file.read().decode("utf-8", errors="ignore")
-            extra = [l.strip() for l in txt.splitlines() if l.strip()]
-            merged = list(dict.fromkeys(get_places() + extra))
-            st.session_state.ALL_PLACES = merged
-            st.success(f"โหลดชื่อเพิ่ม {len(extra)} รายการ")
-        except Exception as e:
-            st.error(f"อ่านไฟล์ไม่สำเร็จ: {e}")
+    st.markdown("---")
+    if st.button("🧹 ล้างสถานที่ทั้งหมดใน session นี้"):
+        st.session_state.all_locations = []
+        st.session_state.lat = None
+        st.session_state.lng = None
+        st.session_state.address = None
+        st.session_state.transcript = ""
+        st.success("ล้างสถานที่ทั้งหมดแล้ว")
 
-colL, colR = st.columns([1,1])
+colL, colR = st.columns([1, 1])
 
+# ---------- LEFT: Audio + Result ----------
 with colL:
-    st.subheader("อินพุต")
-
-    # ช่องพิมพ์ (อย่าไปแก้ session_state ของ key นี้หลังสร้างแล้ว)
-    typed = st.text_input(
-        "พิมพ์ชื่อสถานที่หรือบอกเป็นประโยค",
-        key=INPUT_WIDGET_KEY,
-        placeholder="เช่น: ไปมหาวิทยาลัยเชียงใหม่ / ไปวัดพระแก้ว / ไปสนามบินสุวรรณภูมิ"
-    )
-    go1 = st.button("🔎 ค้นหาพิกัดจากข้อความ", use_container_width=True)
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.write("**ถอดเสียงด้วย Typhoon (อัด/อัปโหลด)**")
+    st.subheader("1️⃣ อัดเสียงคำสั่งเที่ยวบิน (ภาษาไทย/อังกฤษ)")
 
     audio_bytes = None
     try:
         from audio_recorder_streamlit import audio_recorder
+
         audio_bytes = audio_recorder(
             text="กดเพื่ออัด/หยุด",
             recording_color="#e74c3c",
@@ -545,223 +363,154 @@ with colL:
             icon_name="microphone",
             icon_size="2x",
             pause_threshold=2.0,
-            sample_rate=16000
+            sample_rate=16000,
         )
     except Exception:
-        st.info("ฟีเจอร์อัดเสียงใช้ไม่ได้บนสภาพแวดล้อมนี้ — ใช้อัปโหลดไฟล์แทน")
+        st.error("ไม่สามารถใช้ audio_recorder_streamlit ได้ (อาจไม่รองรับใน environment นี้)")
 
     if audio_bytes:
-        st.success("ได้เสียงแล้ว กำลังถอดข้อความ…")
+        st.info("กำลังถอดข้อความจากเสียง…")
         try:
             text_from_voice = typhoon_transcribe(audio_bytes, file_ext=".wav")
-            st.write("**ข้อความที่ถอดได้:**", text_from_voice or "—")
-            if text_from_voice:
-                st.session_state[TRANSCRIBED_KEY] = text_from_voice  # เก็บชั่วคราว (ไม่แตะ key ของ widget)
-                go1 = True
-        except Exception as e:
-            st.error(f"ถอดเสียงล้มเหลว: {e}")
+            st.session_state.transcript = text_from_voice
 
-    up = st.file_uploader("อัปโหลดไฟล์เสียง (wav/mp3/m4a/ogg/flac)",
-                          type=["wav","mp3","m4a","ogg","flac"])
-    if up:
-        st.info("กำลังถอดข้อความจากไฟล์…")
-        try:
-            ext = os.path.splitext(up.name)[1] or ".wav"
-            text_from_file = typhoon_transcribe(up.read(), file_ext=ext)
-            st.write("**ข้อความที่ถอดได้:**", text_from_file or "—")
-            if text_from_file:
-                st.session_state[TRANSCRIBED_KEY] = text_from_file  # เก็บชั่วคราว
-                go1 = True
-        except Exception as e:
-            st.error(f"ถอดเสียงล้มเหลว: {e}")
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # ใช้ข้อความที่มีอยู่จริง: ถ้ามีผลถอดเสียง → ใช้อันนั้นก่อน, ไม่งั้นใช้ค่าที่พิมพ์
-    if go1:
-        effective_text = st.session_state.get(TRANSCRIBED_KEY) or st.session_state.get(INPUT_WIDGET_KEY, "")
-        st.session_state[TRANSCRIBED_KEY] = ""  # เคลียร์ buffer
-
-        q_orig = postprocess_text(effective_text)
-
-        # แกะทุกสถานที่ในประโยค
-        extracted_places = extract_location_from_text(q_orig, return_all=True)
-        
-        # ถ้าไม่เจอสถานที่เลย ใช้ทั้งประโยค
-        if not extracted_places:
-            extracted_places = [q_orig]
-        
-        st.info(f"🔍 พบ {len(extracted_places)} คำที่น่าจะเป็นสถานที่: {', '.join([f'\"**{p}**\"' for p in extracted_places])}")
-        
-        all_results = []
-        failed_places = []
-        
-        with st.spinner("📍 กำลังค้นหาพิกัดจาก Google Maps..."):
-            for place_text in extracted_places:
-                # ลอง geocode โดยตรงด้วย Google
-                loc = geocode_location(place_text)
-                
-                if loc:
-                    all_results.append({
-                        "name": place_text,
-                        "lat": loc.latitude,
-                        "lng": loc.longitude,
-                        "address": loc.address,
-                        "original_query": place_text
-                    })
-                else:
-                    failed_places.append(place_text)
-        
-        # แสดงผลลัพธ์อย่างละเอียด
-        if all_results:
-            st.session_state.all_locations = all_results
-            # เก็บสถานที่แรกใน state เดิม (backward compatible)
-            st.session_state.lat = all_results[0]["lat"]
-            st.session_state.lng = all_results[0]["lng"]
-            st.session_state.address = all_results[0]["address"]
-            st.session_state.fixed_input = all_results[0]["name"]
-            
-            st.success(f"✅ พบพิกัดสำเร็จ: **{len(all_results)}/{len(extracted_places)}** สถานที่")
-            
-            if failed_places:
-                st.warning(f"⚠️ ไม่พบพิกัด: {', '.join([f'\"**{p}**\"' for p in failed_places])}")
-        else:
-            st.session_state.lat = st.session_state.lng = None
-            st.session_state.address = None
-            st.session_state.all_locations = []
-            st.error(f"❌ ไม่พบพิกัดทั้งหมด {len(extracted_places)} สถานที่: {', '.join([f'\"**{p}**\"' for p in extracted_places])}")
-
-    if st.session_state.lat:
-        st.subheader("ผลลัพธ์")
-        
-        # แสดงทุกสถานที่
-        all_locs = st.session_state.get("all_locations", [])
-        if len(all_locs) > 1:
-            st.info(f"🗺️ พบ **{len(all_locs)} สถานที่** ในประโยค (แสดงเส้นทางบนแผนที่)")
-            for idx, loc_data in enumerate(all_locs, 1):
-                st.markdown(f"### สถานที่ที่ {idx}: {loc_data['name']}")
-                c1, c2 = st.columns(2)
-                c1.metric("📍 Latitude", f"{loc_data['lat']:.6f}")
-                c2.metric("📍 Longitude", f"{loc_data['lng']:.6f}")
-                coords = f"{loc_data['lat']}, {loc_data['lng']}"
-                st.code(coords, language="text")
-                if idx < len(all_locs):
-                    st.markdown("⬇️")
-        else:
-            # สถานที่เดียว
-            c1, c2 = st.columns(2)
-            c1.metric("📍 Latitude", f"{st.session_state.lat:.6f}")
-            c2.metric("📍 Longitude", f"{st.session_state.lng:.6f}")
-            st.info(f"**ที่อยู่ (เต็ม):** {st.session_state.address}")
-            coords = f"{st.session_state.lat}, {st.session_state.lng}"
-            st.code(f"https://maps.google.com/?q={coords}", language="text")
-            st.code(coords, language="text")
-
-    st.subheader("แนบภาพภารกิจ (ทางเลือก)")
-    img = st.file_uploader("อัปโหลดภาพ (jpg/png)", type=["jpg","jpeg","png"], key="imgu")
-    if img:
-        try:
-            st.image(Image.open(img), use_column_width=True)
-        except Exception as e:
-            st.error(f"แสดงภาพไม่สำเร็จ: {e}")
-
-with colR:
-    st.subheader("แผนที่ (Google Maps)")
-    if st.session_state.lat:
-        all_locs = st.session_state.get("all_locations", [])
-        gmaps_key = load_google_maps_key()
-        
-        if not gmaps_key:
-            st.warning("⚠️ ไม่มี Google Maps API key - กำลังใช้แผนที่ทดแทน")
-            # fallback ใช้ Folium
-            m = folium.Map(location=[st.session_state.lat, st.session_state.lng], zoom_start=10)
-            for idx, loc_data in enumerate(all_locs, 1):
-                folium.Marker(
-                    location=[loc_data["lat"], loc_data["lng"]],
-                    popup=f"📍 {loc_data['name']}<br>{loc_data['lat']:.6f}, {loc_data['lng']:.6f}",
-                    tooltip=f"{idx}. {loc_data['name']}",
-                    icon=folium.Icon(color="red" if idx == 1 else "blue", icon="info-sign")
-                ).add_to(m)
-            
-            # วาดเส้นเชื่อม
-            if len(all_locs) > 1:
-                coords = [[loc["lat"], loc["lng"]] for loc in all_locs]
-                folium.PolyLine(coords, color="red", weight=3, opacity=0.7).add_to(m)
-            
-            if st_folium:
-                st_folium(m, width=720, height=520)
-        else:
-            # ใช้ Google Maps
-            if len(all_locs) == 1:
-                center_lat = all_locs[0]["lat"]
-                center_lng = all_locs[0]["lng"]
-                zoom = 15
+            if not gmaps_key:
+                st.error("ไม่มี Google Maps API key จึงยัง geocode ไม่ได้")
             else:
-                # หาจุดกึ่งกลาง
-                center_lat = sum([loc["lat"] for loc in all_locs]) / len(all_locs)
-                center_lng = sum([loc["lng"] for loc in all_locs]) / len(all_locs)
-                zoom = 10
-            
-            # สร้าง markers string
-            markers_js = ""
-            for idx, loc_data in enumerate(all_locs, 1):
-                label = idx
-                markers_js += f"""
-                new google.maps.Marker({{
-                    position: {{lat: {loc_data['lat']}, lng: {loc_data['lng']}}},
-                    map: map,
-                    label: '{label}',
-                    title: '{loc_data['name']}'
-                }});
-                """
-            
-            # สร้าง polyline (เส้นเชื่อม)
-            polyline_js = ""
-            if len(all_locs) > 1:
-                coords_str = ",".join([f"{{lat: {loc['lat']}, lng: {loc['lng']}}}" for loc in all_locs])
-                polyline_js = f"""
-                const flightPath = new google.maps.Polyline({{
-                    path: [{coords_str}],
-                    geodesic: true,
-                    strokeColor: "#FF0000",
-                    strokeOpacity: 1.0,
-                    strokeWeight: 3,
-                }});
-                flightPath.setMap(map);
-                """
-            
-            # Google Maps HTML
-            map_html = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <style>
-                    #map {{
-                        height: 520px;
-                        width: 100%;
-                    }}
-                </style>
-            </head>
-            <body>
-                <div id="map"></div>
-                <script>
-                    function initMap() {{
-                        const map = new google.maps.Map(document.getElementById("map"), {{
-                            zoom: {zoom},
-                            center: {{lat: {center_lat}, lng: {center_lng}}},
-                        }});
-                        
-                        {markers_js}
-                        {polyline_js}
-                    }}
-                </script>
-                <script async defer
-                    src="https://maps.googleapis.com/maps/api/js?key={gmaps_key}&callback=initMap">
-                </script>
-            </body>
-            </html>
-            """
-            
-            st.components.v1.html(map_html, height=550)
+                # 1 ประโยค → แยกหลายสถานที่
+                places = extract_location_from_text(text_from_voice)
+                q_clean = postprocess_text(text_from_voice)
+
+                if not places:
+                    # ถ้าแยกไม่ออกเลย ให้ใช้ทั้งประโยคเป็น query
+                    places = [q_clean]
+
+                st.info(f"จากประโยคนี้ แยกได้ {len(places)} คำที่น่าจะเป็นสถานที่:\n" +
+                        ", ".join([f"`{p}`" for p in places]))
+
+                success_count = 0
+                fail_list = []
+
+                for place_text in places:
+                    loc, raw_json = geocode_location_google(place_text, api_key=gmaps_key)
+                    if loc:
+                        lat, lng, address = loc
+                        st.session_state.lat = lat
+                        st.session_state.lng = lng
+                        st.session_state.address = address
+
+                        idx = len(st.session_state.all_locations) + 1
+                        st.session_state.all_locations.append({
+                            "index": idx,
+                            "text": q_clean,
+                            "place_text": place_text,
+                            "lat": lat,
+                            "lng": lng,
+                            "address": address,
+                            "raw_json": raw_json,
+                        })
+                        success_count += 1
+                    else:
+                        fail_list.append(place_text)
+
+                if success_count:
+                    st.success(f"✅ geocode สำเร็จ {success_count}/{len(places)} สถานที่")
+                if fail_list:
+                    st.warning("⚠️ สถานที่เหล่านี้ geocode ไม่สำเร็จ: " +
+                               ", ".join([f"`{p}`" for p in fail_list]))
+
+        except Exception as e:
+            st.error(f"ถอดเสียง/เรียก Geocoding ล้มเหลว: {e}")
+
+    # transcript ล่าสุด
+    if st.session_state.transcript:
+        st.markdown("### ✅ ข้อความล่าสุดที่ถอดได้")
+        st.write(st.session_state.transcript or "—")
+
+    # รายการสถานที่ทั้งหมด (ทุกประโยคที่เคยอัด)
+    if st.session_state.all_locations:
+        st.markdown("### 2️⃣ รายการทุกสถานที่ที่ได้พิกัดแล้ว")
+        for loc in st.session_state.all_locations:
+            st.markdown(f"**#{loc['index']}** – จากคำว่า: `{loc['place_text']}`")
+            c1, c2 = st.columns(2)
+            c1.metric("Latitude", f"{loc['lat']:.6f}")
+            c2.metric("Longitude", f"{loc['lng']:.6f}")
+            st.write("ที่อยู่ (formatted_address):")
+            st.code(loc["address"], language="text")
+
+            with st.expander("ดู JSON จาก Google Geocoding สำหรับจุดนี้"):
+                st.json(loc["raw_json"])
+            st.write("---")
+
+# ---------- RIGHT: Map ----------
+with colR:
+    st.subheader("3️⃣ แผนที่ Google Maps (ทุกจุดที่เจอ)")
+
+    if not gmaps_key:
+        st.warning("⚠️ ยังไม่ได้ตั้งค่า Google Maps API key จึงแสดงแผนที่ไม่ได้")
+    elif not st.session_state.all_locations:
+        st.info("ยังไม่มีพิกัด — กรุณาอัดเสียงสักประโยคก่อน")
     else:
-        st.info("พิมพ์หรือพูดชื่อสถานที่ แล้วกดค้นหา เพื่อให้แผนที่ปรากฏ")
+        all_locs = st.session_state.all_locations
+
+        center_lat = sum(loc["lat"] for loc in all_locs) / len(all_locs)
+        center_lng = sum(loc["lng"] for loc in all_locs) / len(all_locs)
+
+        markers_js = ""
+        for loc in all_locs:
+            title = f"#{loc['index']}: {loc['place_text']}".replace("'", "\\'")
+            markers_js += f"""
+            new google.maps.Marker({{
+                position: {{lat: {loc['lat']}, lng: {loc['lng']}}},
+                map: map,
+                label: '{loc['index']}',
+                title: '{title}'
+            }});
+            """
+
+        polyline_js = ""
+        if len(all_locs) > 1:
+            coords_str = ",".join([f"{{lat: {loc['lat']}, lng: {loc['lng']}}}" for loc in all_locs])
+            polyline_js = f"""
+            const flightPath = new google.maps.Polyline({{
+                path: [{coords_str}],
+                geodesic: true,
+                strokeColor: "#FF0000",
+                strokeOpacity: 1.0,
+                strokeWeight: 3,
+            }});
+            flightPath.setMap(map);
+            """
+
+        map_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                #map {{
+                    height: 520px;
+                    width: 100%;
+                }}
+            </style>
+        </head>
+        <body>
+            <div id="map"></div>
+            <script>
+                function initMap() {{
+                    const center = {{lat: {center_lat}, lng: {center_lng}}};
+                    const map = new google.maps.Map(document.getElementById("map"), {{
+                        zoom: 9,
+                        center: center,
+                    }});
+                    {markers_js}
+                    {polyline_js}
+                }}
+            </script>
+            <script async defer
+                src="https://maps.googleapis.com/maps/api/js?key={gmaps_key}&callback=initMap">
+            </script>
+        </body>
+        </html>
+        """
+
+        st.components.v1.html(map_html, height=550)
