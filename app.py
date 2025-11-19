@@ -81,7 +81,7 @@ def make_client():
 
     # Defaults
     base  = base  or "https://api.opentyphoon.ai/v1"
-    model = model or "typhoon-v2.5-30b-a3b-instruct"
+    model = model or "typhoon-v1.5x-70b-instruct"
 
     if not key: raise RuntimeError("ไม่พบ API Key (Typhoon/OpenAI)")
     return OpenAI(api_key=key, base_url=base), model
@@ -160,7 +160,6 @@ def extract_flight_info_llm(text: str):
 # =========================
 def typhoon_transcribe(audio_bytes: bytes) -> str:
     client, model = make_client()
-    # ถ้าใช้ Typhoon ASR ให้เปลี่ยน model ตรงนี้ตาม document
     model_asr = "typhoon-asr-realtime" 
     
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
@@ -227,48 +226,56 @@ with colL:
     audio_bytes = None
     try:
         from audio_recorder_streamlit import audio_recorder
+        # ✅ เพิ่ม pause_threshold=300.0 ให้รอความเงียบได้นาน (ไม่ตัดเอง)
         audio_bytes = audio_recorder(
             text="",
             recording_color="#e74c3c",
             neutral_color="#34495e",
             icon_size="2x",
+            pause_threshold=300.0,  
+            sample_rate=44100
         )
     except:
         st.error("Please install audio-recorder-streamlit")
 
     # Processor Loop
     if audio_bytes:
-        # Clear old data
-        st.session_state.all_locations = []
-        st.session_state.extracted_data = None
-        st.session_state.transcript = ""
+        # ✅ เพิ่มตัวเช็คขนาดไฟล์: ต้องมากกว่า 5KB ถึงจะทำงาน (กัน Error 500)
+        if len(audio_bytes) > 5000:
+            # Clear old data
+            st.session_state.all_locations = []
+            st.session_state.extracted_data = None
+            st.session_state.transcript = ""
 
-        with st.spinner("กำลังประมวลผลเสียง..."):
-            try:
-                # 1. Transcribe
-                text_val = typhoon_transcribe(audio_bytes)
-                st.session_state.transcript = text_val
-                
-                # 2. Extract JSON
-                if text_val:
-                    extracted = extract_flight_info_llm(text_val)
-                    st.session_state.extracted_data = extracted
+            with st.spinner("กำลังประมวลผลเสียง..."):
+                try:
+                    # 1. Transcribe
+                    text_val = typhoon_transcribe(audio_bytes)
+                    st.session_state.transcript = text_val
                     
-                    # 3. Geocode Destinations
-                    dests = extracted.get("destination", [])
-                    for idx, place in enumerate(dests):
-                        loc_data, raw_json = geocode_location_google(place, gmaps_key)
-                        if loc_data:
-                            st.session_state.all_locations.append({
-                                "index": idx + 1,
-                                "place_text": place,
-                                "lat": loc_data[0],
-                                "lng": loc_data[1],
-                                "address": loc_data[2],
-                                "raw_json": raw_json
-                            })
-            except Exception as e:
-                st.error(f"Error: {e}")
+                    # 2. Extract JSON
+                    if text_val:
+                        extracted = extract_flight_info_llm(text_val)
+                        st.session_state.extracted_data = extracted
+                        
+                        # 3. Geocode Destinations
+                        dests = extracted.get("destination", [])
+                        for idx, place in enumerate(dests):
+                            loc_data, raw_json = geocode_location_google(place, gmaps_key)
+                            if loc_data:
+                                st.session_state.all_locations.append({
+                                    "index": idx + 1,
+                                    "place_text": place,
+                                    "lat": loc_data[0],
+                                    "lng": loc_data[1],
+                                    "address": loc_data[2],
+                                    "raw_json": raw_json
+                                })
+                except Exception as e:
+                    st.error(f"Error: {e}")
+        else:
+            # ถ้าไฟล์เล็กเกินไป (กดผิด/กดเร็วไป) ให้เตือน
+            st.warning("⚠️ เสียงสั้นเกินไป กรุณาลองใหม่อีกครั้ง (กดอัด > พูดจนจบ > กดหยุด)")
 
     # Display: Transcript
     if st.session_state.transcript:
