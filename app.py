@@ -129,7 +129,7 @@ Schema:
         try:
             st.write(model)
             response = client.chat.completions.create(
-                model=model,
+                model="typhoon-v2.5-30b-a3b-instruct",
                 messages=[
                     {"role": "system", "content": "You are a helpful assistant. Output valid JSON only. Convert text numbers to digits."},
                     {"role": "user", "content": prompt}
