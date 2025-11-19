@@ -127,6 +127,7 @@ Schema:
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            st.write(model)
             response = client.chat.completions.create(
                 model=model,
                 messages=[
