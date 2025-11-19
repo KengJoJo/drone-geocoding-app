@@ -127,7 +127,6 @@ Schema:
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            st.write(model)
             response = client.chat.completions.create(
                 model="typhoon-v2.5-30b-a3b-instruct",
                 messages=[
@@ -217,6 +216,7 @@ with colL:
                 try:
                     # 1. Transcribe
                     text_val = typhoon_transcribe(audio_bytes)
+                    st.write(text_val)
                     st.session_state.transcript = text_val
                     
                     # 2. Extract JSON (Retry & Convert built-in)
@@ -252,7 +252,7 @@ with colL:
         c2.metric("Altitude", ", ".join(data.get("altitude", [])) or "-")
         c3.metric("Destinations", str(len(data.get("destination", []))))
         
-        with st.expander("ดู JSON ดิบ"):
+        with st.expander("ดู JSON"):
             st.json(data)
 
     if st.session_state.all_locations:
