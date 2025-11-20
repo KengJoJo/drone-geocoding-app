@@ -245,6 +245,28 @@ def naive_extract_from_text(text: str) -> Dict[str, List[str]]:
 
     return result
 
+def build_user_prompt(transcribed: str) -> str:
+    """
+    โครง prompt แบบเดียวกับ ty_text.py
+    - บอกภารกิจชัดเจน
+    - กติกาชัด ว่าต้องตอบ JSON อย่างเดียว ไม่มีคำอธิบายเพิ่ม
+    """
+    return f"""ภารกิจ: อ่านคำสั่งควบคุมโดรน และดึงค่าเป็น JSON "อย่างเดียว" ตามสคีมาต่อไปนี้:
+{{
+  "altitude": ["<ตัวเลขและหน่วย>","..."],
+  "speed": ["<ตัวเลขและหน่วย>","..."],
+  "destination": ["<ชื่อสถานที่>","..."]
+}}
+
+กติกา:
+- ตอบเป็น JSON เพียงอย่างเดียว ห้ามมีคำอธิบาย ข้อความนำ/ปิด หรือโค้ดบล็อค
+- เรียงค่าตามลำดับที่ปรากฏในข้อความ
+- หน่วยให้คงตามต้นฉบับ (เช่น "เมตรต่อวินาที")
+- ถ้าไม่มีค่า ให้ส่ง array ว่าง []
+
+ข้อความอินพุต:
+"{transcribed.strip()}"
+"""
 
 # =========================
 # ส่วนที่ 4: Core Logic (AI & Geocoding)
@@ -255,7 +277,7 @@ def naive_extract_from_text(text: str) -> Dict[str, List[str]]:
 
 def extract_flight_info_llm(text: str) -> Dict[str, List[str]]:
     """
-    ใช้ Typhoon LLM แปลง "คำสั่งโดรน" จากข้อความ (ซึ่งอาจมีคำผิด/คำอ่านตัวเลข)
+    ใช้ Typhoon LLM แปลง "คำสั่งโดรน" จากข้อความ
     → เป็น JSON ตาม schema:
     {
         "altitude": ["..."],
@@ -263,84 +285,35 @@ def extract_flight_info_llm(text: str) -> Dict[str, List[str]]:
         "destination": ["..."]
     }
 
-    ใช้ few-shot examples + กติกาชัด ๆ ให้ LLM ดึงข้อมูลได้ดีขึ้น
+    ใช้โครง prompt / กติกาแบบเดียวกับ ty_text.py:
+    - system prompt: Typhoon by SCB 10X, เน้นตอบ JSON ไม่มี extra text
+    - user prompt: build_user_prompt(...) ตามสคีมาด้านบน
     """
     client, _ = make_client()
 
-    # ตัวอย่างการใช้งาน (few-shot) ให้โมเดลเรียนรู้รูปแบบ
-    examples = """
-ตัวอย่างที่ 1
-คำสั่ง: "เริ่มบินจากมหาวิทยาลัยกรุงเทพ ด้วยความเร็ว 55 เมตรต่อวินาที ที่ความสูง 45 เมตร ไปยังฟิวเจอร์ปาร์ครังสิต"
-คำตอบ JSON:
-{
-  "altitude": ["45 เมตร"],
-  "speed": ["55 เมตรต่อวินาที"],
-  "destination": ["มหาวิทยาลัยกรุงเทพ", "ฟิวเจอร์ปาร์ครังสิต"]
-}
-
-ตัวอย่างที่ 2
-คำสั่ง: "ให้โดรนทะยานที่ความสูง 30 เมตร บินด้วยความเร็ว 10 เมตรต่อวินาที ไปที่เซ็นทรัลลาดพร้าว"
-คำตอบ JSON:
-{
-  "altitude": ["30 เมตร"],
-  "speed": ["10 เมตรต่อวินาที"],
-  "destination": ["เซ็นทรัลลาดพร้าว"]
-}
-
-ตัวอย่างที่ 3
-คำสั่ง: "เริ่มจากฟิวเจอร์ปาร์ค รังสิต แล้วไปดรีมเวิลด์ ที่ความสูงห้าสิบเมตร ความเร็วยี่สิบเมตรต่อวินาที"
-คำตอบ JSON:
-{
-  "altitude": ["50 เมตร"],
-  "speed": ["20 เมตรต่อวินาที"],
-  "destination": ["ฟิวเจอร์ปาร์ค รังสิต", "ดรีมเวิลด์"]
-}
-"""
-
-    prompt = f"""
-ภารกิจของคุณ:
-- อ่าน "ข้อความคำสั่งโดรน" ซึ่งอาจมีคำผิดและตัวเลขเป็นคำอ่านภาษาไทย
-- แปลงเป็น JSON ตาม schema ด้านล่าง
-- ห้ามตอบอย่างอื่นนอกจาก JSON
-
-Schema JSON ที่ต้องส่งกลับ:
-{{
-  "altitude": ["<ตัวเลขและหน่วย เช่น 45 เมตร>"],
-  "speed": ["<ตัวเลขและหน่วย เช่น 55 เมตรต่อวินาที>"],
-  "destination": ["<ชื่อสถานที่ตามลำดับเส้นทาง>", "<ชื่อสถานที่ถัดไป>", "..."]
-}}
-
-กติกา:
-1. destination ต้องรวบรวม "ทุกสถานที่" ที่ถูกกล่าวถึงในคำสั่ง
-   - รวมทั้งจุดเริ่มต้นและจุดหมายปลายทาง
-   - เรียงตามลำดับการบินจากต้นทางไปปลายทาง
-2. แปลงคำอ่านตัวเลขไทยให้เป็นตัวเลขอารบิก เช่น:
-   - "ห้าสิบห้า เมตรต่อวินาที" → "55 เมตรต่อวินาที"
-   - "สี่สิบห้า เมตร" → "45 เมตร"
-3. ถ้าไม่พบค่าใด ให้คืน array ว่าง ๆ สำหรับ key นั้น เช่น "altitude": []
-4. ห้ามใส่ comment หรือข้อความอื่นที่ไม่ใช่ JSON
-
-{examples}
-
-ตอนนี้คือข้อความคำสั่งจริง:
-\"\"\"{text.strip()}\"\"\" 
-กรุณาตอบกลับเป็น JSON เพียงอย่างเดียวตาม schema ด้านบน
-""".strip()
-
     max_retries = 3
-    empty_result = {"altitude": [], "speed": [], "destination": []}
+    empty_result: Dict[str, List[str]] = {"altitude": [], "speed": [], "destination": []}
+
+    # เตรียม messages แบบเดียวกับ ty_text.py
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are Typhoon by SCB 10X. Respond ONLY in Thai when the user is Thai. "
+                "When asked for JSON, output a valid JSON object with no extra text."
+            ),
+        },
+        {
+            "role": "user",
+            "content": build_user_prompt(text),
+        },
+    ]
 
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
                 model=TYPHOON_INSTRUCT_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful assistant. Output valid JSON only. Convert Thai text numbers to digits.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
+                messages=messages,
                 temperature=0.1,
                 max_tokens=512,
             )
@@ -349,11 +322,12 @@ Schema JSON ที่ต้องส่งกลับ:
             json_str = extract_first_json_object(raw_content)
 
             if not json_str:
+                # ถ้าแกะ JSON ไม่ได้เลย → คืนค่า default
                 return empty_result
 
             data = json.loads(json_str)
 
-            # กันเคสโมเดลลืม key หรือให้ type แปลก ๆ
+            # กันเคสโมเดลลืม key หรือให้ type แปลก ๆ (ไม่ใช่ list)
             for key in ["altitude", "speed", "destination"]:
                 if key not in data or not isinstance(data[key], list):
                     data[key] = []
@@ -365,11 +339,11 @@ Schema JSON ที่ต้องส่งกลับ:
                 time.sleep(1)
                 continue
 
+            # ครบจำนวน retry แล้วยัง error → แจ้งบนหน้าเว็บ แล้วคืนค่า default
             st.error(f"LLM Error (ลองแล้ว {max_retries} ครั้งยังไม่สำเร็จ): {e}")
             return empty_result
 
     return empty_result
-
 
 def typhoon_transcribe(audio_bytes: bytes) -> str:
     """
