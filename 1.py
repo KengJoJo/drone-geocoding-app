@@ -192,9 +192,58 @@ def extract_first_json_object(text: str) -> Optional[str]:
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                return s[start : i + 1]
+                return s[start: i + 1]
 
     return None
+
+
+def naive_extract_from_text(text: str) -> Dict[str, List[str]]:
+    """
+    fallback แบบง่าย ๆ ถ้า LLM แยกข้อมูลไม่ได้:
+    - ใช้ regex หา speed / altitude จากหน่วยที่คุ้นเคย
+    - หา destination จากคำว่า 'จาก', 'ไปที่', 'ไปยัง', 'แล้วไป'
+    """
+    result = {"altitude": [], "speed": [], "destination": []}
+    t = re.sub(r"\s+", " ", text)
+
+    # --- หา speed ---
+    # ตัวอย่าง: "55 เมตรต่อวินาที", "20 เมตรต่อวินาที"
+    speed_match = re.findall(r"(\d+)\s*เมตรต่อวินาที", t)
+    if speed_match:
+        result["speed"].append(f"{speed_match[0]} เมตรต่อวินาที")
+
+    # --- หา altitude ---
+    # ตัวอย่าง: "45 เมตร", "50 เมตร" (ระวังอย่าไปชน speed)
+    alt_match = re.findall(r"(\d+)\s*เมตร(?!ต่อวินาที)", t)
+    if alt_match:
+        result["altitude"].append(f"{alt_match[0]} เมตร")
+
+    # --- หา destination แบบโง่ ๆ จากคำเชื่อม ---
+    dest_candidates: List[str] = []
+
+    # pattern: "จาก ... ไปยัง/ไปที่/แล้วไป ..."
+    m_from = re.search(r"จาก\s+(.+?)\s+(ไปยัง|ไปที่|แล้วไป|แล้วไปยัง)", t)
+    if m_from:
+        dest_candidates.append(m_from.group(1).strip())
+
+    # pattern: "ไปที่/ไปยัง/แล้วไป/แล้วไปยัง ..."
+    m_to_all = re.findall(r"(ไปที่|ไปยัง|แล้วไปยัง|แล้วไปที่)\s+(.+)", t)
+    for _, name in m_to_all:
+        # ตัดท้ายที่คำว่า "ที่ความสูง" / "ด้วยความเร็ว" ถ้ามี
+        name = re.split(r"(ที่ความสูง|ด้วยความเร็ว|ความเร็ว|ที่ระดับ)", name)[0]
+        name = name.strip(" ,.ๆ")
+        if name:
+            dest_candidates.append(name)
+
+    # ลบซ้ำแบบง่าย ๆ
+    unique_dest: List[str] = []
+    for d in dest_candidates:
+        if d and d not in unique_dest:
+            unique_dest.append(d)
+
+    result["destination"] = unique_dest
+
+    return result
 
 
 # =========================
@@ -214,20 +263,45 @@ def extract_flight_info_llm(text: str) -> Dict[str, List[str]]:
         "destination": ["..."]
     }
 
-    หมายเหตุสำคัญ:
-    - destination ต้องรวบรวม "ทุกสถานที่" ที่กล่าวถึงในคำสั่ง
-      รวมทั้งจุดเริ่มต้นและจุดหมายปลายทาง เรียงตามลำดับการเดินทาง
-      เช่น "เริ่มบินจากมหาวิทยาลัยกรุงเทพ ไปยังฟิวเจอร์ปาร์ครังสิต"
-      → "destination": ["มหาวิทยาลัยกรุงเทพ", "ฟิวเจอร์ปาร์ครังสิต"]
-    - แปลงเลขคำอ่านภาษาไทยเป็นตัวเลข (เช่น "ยี่สิบ" → "20 เมตรต่อวินาที")
-    - แก้คำผิดพื้นฐานตามบริบทการบิน
-    - มีระบบ retry เมื่อ API error
+    ใช้ few-shot examples + กติกาชัด ๆ ให้ LLM ดึงข้อมูลได้ดีขึ้น
     """
     client, _ = make_client()
 
-    # Prompt ภาษาไทยอธิบายภารกิจให้โมเดล
+    # ตัวอย่างการใช้งาน (few-shot) ให้โมเดลเรียนรู้รูปแบบ
+    examples = """
+ตัวอย่างที่ 1
+คำสั่ง: "เริ่มบินจากมหาวิทยาลัยกรุงเทพ ด้วยความเร็ว 55 เมตรต่อวินาที ที่ความสูง 45 เมตร ไปยังฟิวเจอร์ปาร์ครังสิต"
+คำตอบ JSON:
+{
+  "altitude": ["45 เมตร"],
+  "speed": ["55 เมตรต่อวินาที"],
+  "destination": ["มหาวิทยาลัยกรุงเทพ", "ฟิวเจอร์ปาร์ครังสิต"]
+}
+
+ตัวอย่างที่ 2
+คำสั่ง: "ให้โดรนทะยานที่ความสูง 30 เมตร บินด้วยความเร็ว 10 เมตรต่อวินาที ไปที่เซ็นทรัลลาดพร้าว"
+คำตอบ JSON:
+{
+  "altitude": ["30 เมตร"],
+  "speed": ["10 เมตรต่อวินาที"],
+  "destination": ["เซ็นทรัลลาดพร้าว"]
+}
+
+ตัวอย่างที่ 3
+คำสั่ง: "เริ่มจากฟิวเจอร์ปาร์ค รังสิต แล้วไปดรีมเวิลด์ ที่ความสูงห้าสิบเมตร ความเร็วยี่สิบเมตรต่อวินาที"
+คำตอบ JSON:
+{
+  "altitude": ["50 เมตร"],
+  "speed": ["20 เมตรต่อวินาที"],
+  "destination": ["ฟิวเจอร์ปาร์ค รังสิต", "ดรีมเวิลด์"]
+}
+"""
+
     prompt = f"""
-ภารกิจ: อ่านข้อความคำสั่งโดรน (ซึ่งอาจมีคำผิดจาก ASR) แล้วแปลงเป็น JSON
+ภารกิจของคุณ:
+- อ่าน "ข้อความคำสั่งโดรน" ซึ่งอาจมีคำผิดและตัวเลขเป็นคำอ่านภาษาไทย
+- แปลงเป็น JSON ตาม schema ด้านล่าง
+- ห้ามตอบอย่างอื่นนอกจาก JSON
 
 Schema JSON ที่ต้องส่งกลับ:
 {{
@@ -236,22 +310,21 @@ Schema JSON ที่ต้องส่งกลับ:
   "destination": ["<ชื่อสถานที่ตามลำดับเส้นทาง>", "<ชื่อสถานที่ถัดไป>", "..."]
 }}
 
-คำอธิบาย destination:
-- ให้ดึง "ทุกสถานที่" ที่ถูกกล่าวถึงในคำสั่ง เช่น ทั้งจุดเริ่มต้นและจุดหมายปลายทาง
-- เรียงตามลำดับการเดินทางจากต้นทางไปปลายทาง
-- ตัวอย่าง:
-  - คำสั่ง: "เริ่มบินจากมหาวิทยาลัยกรุงเทพ ไปยังฟิวเจอร์ปาร์ครังสิต"
-    → "destination": ["มหาวิทยาลัยกรุงเทพ", "ฟิวเจอร์ปาร์ครังสิต"]
-  - คำสั่ง: "บินจาก A แล้วไป B ต่อไป C"
-    → "destination": ["A", "B", "C"]
+กติกา:
+1. destination ต้องรวบรวม "ทุกสถานที่" ที่ถูกกล่าวถึงในคำสั่ง
+   - รวมทั้งจุดเริ่มต้นและจุดหมายปลายทาง
+   - เรียงตามลำดับการบินจากต้นทางไปปลายทาง
+2. แปลงคำอ่านตัวเลขไทยให้เป็นตัวเลขอารบิก เช่น:
+   - "ห้าสิบห้า เมตรต่อวินาที" → "55 เมตรต่อวินาที"
+   - "สี่สิบห้า เมตร" → "45 เมตร"
+3. ถ้าไม่พบค่าใด ให้คืน array ว่าง ๆ สำหรับ key นั้น เช่น "altitude": []
+4. ห้ามใส่ comment หรือข้อความอื่นที่ไม่ใช่ JSON
 
-เงื่อนไขสำคัญ:
-1. แปลงคำอ่านตัวเลข (เช่น "ยี่สิบ", "เก้าสิบห้า") ให้เป็นตัวเลขอารบิกในผลลัพธ์เสมอ
-2. แก้คำผิดตามบริบทการบิน เช่น "พยาน" -> "ทะยาน", "มังกรุงเทพ" -> "ม.กรุงเทพ"
-3. ตอบเป็น JSON เท่านั้น ห้ามมีคำอธิบายอื่นหรือข้อความอื่นนอกเหนือจาก JSON
+{examples}
 
-ข้อความ input:
+ตอนนี้คือข้อความคำสั่งจริง:
 \"\"\"{text.strip()}\"\"\" 
+กรุณาตอบกลับเป็น JSON เพียงอย่างเดียวตาม schema ด้านบน
 """.strip()
 
     max_retries = 3
@@ -276,22 +349,27 @@ Schema JSON ที่ต้องส่งกลับ:
             json_str = extract_first_json_object(raw_content)
 
             if not json_str:
-                # ถ้าแกะ JSON ไม่ได้ ให้คืนค่า default ว่าง ๆ
                 return empty_result
 
-            return json.loads(json_str)
+            data = json.loads(json_str)
+
+            # กันเคสโมเดลลืม key หรือให้ type แปลก ๆ
+            for key in ["altitude", "speed", "destination"]:
+                if key not in data or not isinstance(data[key], list):
+                    data[key] = []
+
+            return data
 
         except Exception as e:
-            # ถ้า error และยังไม่ครบจำนวน retry ให้พัก 1 วินาทีแล้วลองใหม่
             if attempt < max_retries - 1:
                 time.sleep(1)
                 continue
 
-            # ถ้าลองครบแล้วแล้วยัง error ให้แจ้งบนหน้าเว็บ
             st.error(f"LLM Error (ลองแล้ว {max_retries} ครั้งยังไม่สำเร็จ): {e}")
             return empty_result
 
     return empty_result
+
 
 def typhoon_transcribe(audio_bytes: bytes) -> str:
     """
@@ -362,7 +440,7 @@ def geocode_location_google(
 # =========================
 # ส่วนที่ 5: UI Layout (หน้าเว็บหลัก)
 # - แบ่งซ้าย/ขวา
-#   ซ้าย: อัดเสียง → ASR → LLM → JSON → Geocoding
+#   ซ้าย: อัดเสียง → ASR → LLM/Regex → JSON → Geocoding
 #   ขวา: แสดงแผนที่ Google Maps
 # =========================
 
@@ -386,7 +464,7 @@ with col_left:
             recording_color="#e74c3c",
             neutral_color="#34495e",
             icon_size="3x",
-            pause_threshold=30.0,  # ไม่ตัดเองจนกว่าจะเงียบ 30 วินาที (ให้ผู้ใช้กดหยุดเอง)( 600.0 คือ 10 นาที)
+            pause_threshold=30.0,  # ไม่ตัดเองจนกว่าจะเงียบ 30 วินาที
             sample_rate=44100,
         )
     except Exception:
@@ -401,16 +479,34 @@ with col_left:
             st.session_state.extracted_data = None
             st.session_state.transcript = ""
 
-            with st.spinner("🔊 กำลังถอดความและวิเคราะห์ด้วย AI..."):
+            with st.spinner("🔊 กำลังถอดความและวิเคราะห์"):
                 try:
                     # 1) ถอดเสียงเป็นข้อความด้วย Typhoon ASR
                     transcript = typhoon_transcribe(audio_bytes)
                     st.session_state.transcript = transcript
                     st.write(transcript)
 
-                    # 2) ส่งข้อความให้ LLM สกัดเป็น JSON
+                    # 2) ส่งข้อความให้ LLM สกัดเป็น JSON + ใช้ fallback ถ้าจำเป็น
                     if transcript:
                         extracted = extract_flight_info_llm(transcript)
+
+                        # ถ้า LLM แยกอะไรไม่ได้เลย → ใช้ regex fallback
+                        if (
+                            not extracted.get("destination")
+                            and not extracted.get("altitude")
+                            and not extracted.get("speed")
+                        ):
+                            extracted = naive_extract_from_text(transcript)
+                        else:
+                            # ถ้า destination ยังว่าง หรือดูน้อยผิดปกติ → เติมด้วย fallback
+                            fallback = naive_extract_from_text(transcript)
+                            if not extracted.get("destination") and fallback.get("destination"):
+                                extracted["destination"] = fallback["destination"]
+                            if not extracted.get("altitude") and fallback.get("altitude"):
+                                extracted["altitude"] = fallback["altitude"]
+                            if not extracted.get("speed") and fallback.get("speed"):
+                                extracted["speed"] = fallback["speed"]
+
                         st.session_state.extracted_data = extracted
 
                         # 3) Geocoding: แปลงทุก destination เป็นพิกัด
@@ -439,7 +535,7 @@ with col_left:
         st.markdown("### ② ข้อความที่ได้จากการถอดเสียง (ASR)")
         st.info(f"🗣️ **ข้อความ:** {st.session_state.transcript}")
 
-    # แสดงข้อมูล JSON ที่สกัดได้จาก LLM
+    # แสดงข้อมูล JSON ที่สกัดได้จาก LLM/regex
     if st.session_state.extracted_data:
         st.markdown("### ③ ข้อมูลคำสั่งที่สกัดเป็น JSON")
 
@@ -539,7 +635,7 @@ with col_right:
                 function initMap() {{
                     const map = new google.maps.Map(document.getElementById("map"), {{
                         zoom: 13,
-                        center: {{lat: {center_lat}, lng: {center_lng}}},
+                        center: {{lat: {center_lat}, lng: {center_lng}}}},
                         mapTypeId: 'terrain'
                     }});
                     {markers_js}
