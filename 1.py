@@ -484,7 +484,6 @@ with col_left:
                     # 1) ถอดเสียงเป็นข้อความด้วย Typhoon ASR
                     transcript = typhoon_transcribe(audio_bytes)
                     st.session_state.transcript = transcript
-                    st.write(transcript)
 
                     # 2) ส่งข้อความให้ LLM สกัดเป็น JSON + ใช้ fallback ถ้าจำเป็น
                     if transcript:
@@ -511,6 +510,11 @@ with col_left:
 
                         # 3) Geocoding: แปลงทุก destination เป็นพิกัด
                         destinations = extracted.get("destination", [])
+
+                        # debug ดูว่าเราส่งคำอะไรไป Geocoding บ้าง
+                        with st.expander("🔍 Debug: สถานที่ที่ส่งไป Geocoding", expanded=False):
+                            st.write(destinations)
+
                         for idx, place_name in enumerate(destinations, start=1):
                             loc_data, raw = geocode_location_google(place_name, gmaps_key)
                             if loc_data:
@@ -524,6 +528,12 @@ with col_left:
                                         "address": address,
                                     }
                                 )
+                            else:
+                                # แสดง status จาก Google ไว้เช็ค key / ชื่อสถานที่
+                                status = raw.get("status") if isinstance(raw, dict) else "no_raw"
+                                st.warning(
+                                    f"Geocoding หาไม่เจอสำหรับ '{place_name}' (status={status})"
+                                )
                 except Exception as e:
                     # ถ้าเกิด error ระหว่าง pipeline ให้แจ้งบนหน้าเว็บ
                     st.error(f"System Error: {e}")
@@ -531,7 +541,7 @@ with col_left:
             st.warning("⚠️ เสียงสั้นเกินไป (กรุณากดอัด > พูด > กดหยุด)")
 
     # แสดง Transcript ที่ถอดได้
-    if st.session_state.transcript:
+    if st.session_state.transcript.strip():
         st.markdown("### ② ข้อความที่ได้จากการถอดเสียง (ASR)")
         st.info(f"🗣️ **ข้อความ:** {st.session_state.transcript}")
 
