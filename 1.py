@@ -196,55 +196,6 @@ def extract_first_json_object(text: str) -> Optional[str]:
 
     return None
 
-
-def naive_extract_from_text(text: str) -> Dict[str, List[str]]:
-    """
-    fallback แบบง่าย ๆ ถ้า LLM แยกข้อมูลไม่ได้:
-    - ใช้ regex หา speed / altitude จากหน่วยที่คุ้นเคย
-    - หา destination จากคำว่า 'จาก', 'ไปที่', 'ไปยัง', 'แล้วไป'
-    """
-    result = {"altitude": [], "speed": [], "destination": []}
-    t = re.sub(r"\s+", " ", text)
-
-    # --- หา speed ---
-    # ตัวอย่าง: "55 เมตรต่อวินาที", "20 เมตรต่อวินาที"
-    speed_match = re.findall(r"(\d+)\s*เมตรต่อวินาที", t)
-    if speed_match:
-        result["speed"].append(f"{speed_match[0]} เมตรต่อวินาที")
-
-    # --- หา altitude ---
-    # ตัวอย่าง: "45 เมตร", "50 เมตร" (ระวังอย่าไปชน speed)
-    alt_match = re.findall(r"(\d+)\s*เมตร(?!ต่อวินาที)", t)
-    if alt_match:
-        result["altitude"].append(f"{alt_match[0]} เมตร")
-
-    # --- หา destination แบบโง่ ๆ จากคำเชื่อม ---
-    dest_candidates: List[str] = []
-
-    # pattern: "จาก ... ไปยัง/ไปที่/แล้วไป ..."
-    m_from = re.search(r"จาก\s+(.+?)\s+(ไปยัง|ไปที่|แล้วไป|แล้วไปยัง)", t)
-    if m_from:
-        dest_candidates.append(m_from.group(1).strip())
-
-    # pattern: "ไปที่/ไปยัง/แล้วไป/แล้วไปยัง ..."
-    m_to_all = re.findall(r"(ไปที่|ไปยัง|แล้วไปยัง|แล้วไปที่)\s+(.+)", t)
-    for _, name in m_to_all:
-        # ตัดท้ายที่คำว่า "ที่ความสูง" / "ด้วยความเร็ว" ถ้ามี
-        name = re.split(r"(ที่ความสูง|ด้วยความเร็ว|ความเร็ว|ที่ระดับ)", name)[0]
-        name = name.strip(" ,.ๆ")
-        if name:
-            dest_candidates.append(name)
-
-    # ลบซ้ำแบบง่าย ๆ
-    unique_dest: List[str] = []
-    for d in dest_candidates:
-        if d and d not in unique_dest:
-            unique_dest.append(d)
-
-    result["destination"] = unique_dest
-
-    return result
-
 def build_user_prompt(transcribed: str) -> str:
     """
     โครง prompt แบบเดียวกับ ty_text.py
@@ -268,6 +219,7 @@ def build_user_prompt(transcribed: str) -> str:
 "{transcribed.strip()}"
 """
 
+
 # =========================
 # ส่วนที่ 4: Core Logic (AI & Geocoding)
 # - ใช้โมเดล Typhoon LLM
@@ -284,17 +236,12 @@ def extract_flight_info_llm(text: str) -> Dict[str, List[str]]:
         "speed": ["..."],
         "destination": ["..."]
     }
-
-    ใช้โครง prompt / กติกาแบบเดียวกับ ty_text.py:
-    - system prompt: Typhoon by SCB 10X, เน้นตอบ JSON ไม่มี extra text
-    - user prompt: build_user_prompt(...) ตามสคีมาด้านบน
     """
     client, _ = make_client()
 
     max_retries = 3
     empty_result: Dict[str, List[str]] = {"altitude": [], "speed": [], "destination": []}
 
-    # เตรียม messages แบบเดียวกับ ty_text.py
     messages = [
         {
             "role": "system",
@@ -322,12 +269,10 @@ def extract_flight_info_llm(text: str) -> Dict[str, List[str]]:
             json_str = extract_first_json_object(raw_content)
 
             if not json_str:
-                # ถ้าแกะ JSON ไม่ได้เลย → คืนค่า default
                 return empty_result
 
             data = json.loads(json_str)
 
-            # กันเคสโมเดลลืม key หรือให้ type แปลก ๆ (ไม่ใช่ list)
             for key in ["altitude", "speed", "destination"]:
                 if key not in data or not isinstance(data[key], list):
                     data[key] = []
@@ -339,11 +284,11 @@ def extract_flight_info_llm(text: str) -> Dict[str, List[str]]:
                 time.sleep(1)
                 continue
 
-            # ครบจำนวน retry แล้วยัง error → แจ้งบนหน้าเว็บ แล้วคืนค่า default
-            st.error(f"LLM Error (ลองแล้ว {max_retries} ครั้งยังไม่สำเร็จ): {e}")
+            st.error(f"LLM Error (ลองแล้ว {max_reTRIES} ครั้งยังไม่สำเร็จ): {e}")
             return empty_result
 
     return empty_result
+
 
 def typhoon_transcribe(audio_bytes: bytes) -> str:
     """
@@ -369,7 +314,6 @@ def typhoon_transcribe(audio_bytes: bytes) -> str:
         text = getattr(resp, "text", "") or ""
         return postprocess_text(text.strip())
     finally:
-        # พยายามลบไฟล์ชั่วคราวออกจากระบบ
         try:
             os.unlink(tmp_path)
         except Exception:
@@ -407,46 +351,60 @@ def geocode_location_google(
         return None, data
 
     except Exception as e:
-        # ถ้า request หลุดหรือ timeout ให้คืน error message กลับไป
         return None, {"error": str(e)}
 
 
 # =========================
 # ส่วนที่ 5: UI Layout (หน้าเว็บหลัก)
 # - แบ่งซ้าย/ขวา
-#   ซ้าย: อัดเสียง → ASR → LLM/Regex → JSON → Geocoding
+#   ซ้าย: อัดเสียง / อัปโหลดไฟล์เสียง → ASR → LLM/Regex → JSON → Geocoding
 #   ขวา: แสดงแผนที่ Google Maps
 # =========================
 
 st.title(APP_TITLE)
 gmaps_key = load_google_maps_key()
 
-# แบ่ง layout เป็น 2 คอลัมน์ (ซ้าย 40%, ขวา 60%)
 col_left, col_right = st.columns([0.4, 0.6], gap="medium")
 
 # ---------- คอลัมน์ซ้าย: Voice → JSON ----------
 with col_left:
     st.subheader("① สั่งงานด้วยเสียง")
 
-    audio_bytes = None
-    try:
-        # component สำหรับอัดเสียงจากไมค์ในหน้าเว็บ
-        from audio_recorder_streamlit import audio_recorder
+    # ให้เลือกโหมดเพื่อคุณภาพเสียงที่ดีที่สุด
+    mode = st.radio(
+        "เลือกวิธีนำเข้าเสียง",
+        ["อัดเสียงผ่านหน้าเว็บ", "อัปโหลดไฟล์เสียง (แนะนำ: อัดจากมือถือแล้วเอามาอัปโหลด)"],
+        index=0,
+    )
 
-        audio_bytes = audio_recorder(
-            text="แตะเพื่อเริ่ม / แตะเพื่อหยุด",
-            recording_color="#e74c3c",
-            neutral_color="#34495e",
-            icon_size="3x",
-            pause_threshold=30.0,  # ไม่ตัดเองจนกว่าจะเงียบ 30 วินาที
-            sample_rate=44100,
+    audio_bytes: Optional[bytes] = None
+
+    if mode == "อัดเสียงผ่านหน้าเว็บ":
+        try:
+            from audio_recorder_streamlit import audio_recorder
+
+            audio_bytes = audio_recorder(
+                text="แตะเพื่อเริ่ม / แตะเพื่อหยุด",
+                recording_color="#e74c3c",
+                neutral_color="#34495e",
+                icon_size="3x",
+                pause_threshold=30.0,
+                sample_rate=44100,  # ใช้ 44.1kHz ซึ่งเป็นมาตรฐานเสียงคุณภาพดี
+            )
+        except Exception:
+            st.error("กรุณาติดตั้งแพ็กเกจ: pip install audio-recorder-streamlit")
+    else:
+        # โหมดอัปโหลดไฟล์เสียงคุณภาพสูง
+        uploaded_file = st.file_uploader(
+            "อัปโหลดไฟล์เสียง (รองรับ .wav, .mp3, .m4a ฯลฯ)",
+            type=["wav", "mp3", "m4a", "ogg", "flac"],
         )
-    except Exception:
-        st.error("กรุณาติดตั้งแพ็กเกจ: pip install audio-recorder-streamlit")
+        if uploaded_file is not None:
+            audio_bytes = uploaded_file.read()
+            st.audio(audio_bytes, format="audio/wav")
 
-    # ถ้ามีเสียงกลับมาจาก audio_recorder
+    # ถ้ามีเสียงจากโหมดใดโหมดหนึ่ง
     if audio_bytes:
-        # กรองเคสเสียงสั้นเกินไป (เช่น เผลอกดแล้วปล่อยทันที)
         if len(audio_bytes) > 2000:
             # เคลียร์ state เดิมก่อนเริ่ม process ใหม่
             st.session_state.all_locations = []
@@ -459,33 +417,14 @@ with col_left:
                     transcript = typhoon_transcribe(audio_bytes)
                     st.session_state.transcript = transcript
 
-                    # 2) ส่งข้อความให้ LLM สกัดเป็น JSON + ใช้ fallback ถ้าจำเป็น
+                    # 2) ใช้ LLM แยกเป็น JSON (ไม่ใช้ fallback แล้ว)
                     if transcript:
                         extracted = extract_flight_info_llm(transcript)
-
-                        # ถ้า LLM แยกอะไรไม่ได้เลย → ใช้ regex fallback
-                        if (
-                            not extracted.get("destination")
-                            and not extracted.get("altitude")
-                            and not extracted.get("speed")
-                        ):
-                            extracted = naive_extract_from_text(transcript)
-                        else:
-                            # ถ้า destination ยังว่าง หรือดูน้อยผิดปกติ → เติมด้วย fallback
-                            fallback = naive_extract_from_text(transcript)
-                            if not extracted.get("destination") and fallback.get("destination"):
-                                extracted["destination"] = fallback["destination"]
-                            if not extracted.get("altitude") and fallback.get("altitude"):
-                                extracted["altitude"] = fallback["altitude"]
-                            if not extracted.get("speed") and fallback.get("speed"):
-                                extracted["speed"] = fallback["speed"]
-
                         st.session_state.extracted_data = extracted
 
                         # 3) Geocoding: แปลงทุก destination เป็นพิกัด
                         destinations = extracted.get("destination", [])
 
-                        # debug ดูว่าเราส่งคำอะไรไป Geocoding บ้าง
                         with st.expander("🔍 Debug: สถานที่ที่ส่งไป Geocoding", expanded=False):
                             st.write(destinations)
 
@@ -503,23 +442,22 @@ with col_left:
                                     }
                                 )
                             else:
-                                # แสดง status จาก Google ไว้เช็ค key / ชื่อสถานที่
                                 status = raw.get("status") if isinstance(raw, dict) else "no_raw"
                                 st.warning(
                                     f"Geocoding หาไม่เจอสำหรับ '{place_name}' (status={status})"
                                 )
                 except Exception as e:
-                    # ถ้าเกิด error ระหว่าง pipeline ให้แจ้งบนหน้าเว็บ
                     st.error(f"System Error: {e}")
         else:
             st.warning("⚠️ เสียงสั้นเกินไป (กรุณากดอัด > พูด > กดหยุด)")
+
 
     # แสดง Transcript ที่ถอดได้
     if st.session_state.transcript.strip():
         st.markdown("### ② ข้อความที่ได้จากการถอดเสียง (ASR)")
         st.info(f"🗣️ **ข้อความ:** {st.session_state.transcript}")
 
-    # แสดงข้อมูล JSON ที่สกัดได้จาก LLM/regex
+    # แสดงข้อมูล JSON
     if st.session_state.extracted_data:
         st.markdown("### ③ ข้อมูลคำสั่งที่สกัดเป็น JSON")
 
@@ -536,7 +474,7 @@ with col_left:
         with st.expander("ดู JSON เต็ม"):
             st.json(data)
 
-    # แสดงรายการพิกัดแต่ละจุดที่ได้จาก Geocoding
+    # แสดงรายการพิกัด
     if st.session_state.all_locations:
         st.markdown("### ④ รายการพิกัดที่ได้จาก Geocoding")
         for loc in st.session_state.all_locations:
@@ -549,26 +487,22 @@ with col_right:
     st.subheader("🗺️ แผนที่เส้นทางบิน")
 
     if not gmaps_key:
-        # ถ้าไม่มี Google Maps API Key ให้เตือนผู้ใช้
         st.warning("⚠️ ไม่พบ Google Maps API Key (กรุณาตั้งค่าใน st.secrets หรือ Environment variable)")
     elif not st.session_state.all_locations:
-        # ถ้ายังไม่มีพิกัด → แสดงกล่องว่างรอข้อมูล
         st.markdown(
             """
             <div style='height:650px; border:2px dashed #555; border-radius:12px; 
                  display:flex; align-items:center; justify-content:center; color:#888;'>
-                รอข้อมูลพิกัด... (กรุณากดอัดเสียงแล้วสั่งงาน)
+                รอข้อมูลพิกัด... (กรุณาอัดเสียงหรืออัปโหลดไฟล์เสียง แล้วสั่งงาน)
             </div>
             """,
             unsafe_allow_html=True,
         )
     else:
-        # คำนวณจุดกึ่งกลางของทุกพิกัดเพื่อใช้เป็น center ของแผนที่
         all_locs = st.session_state.all_locations
         center_lat = sum(l["lat"] for l in all_locs) / len(all_locs)
         center_lng = sum(l["lng"] for l in all_locs) / len(all_locs)
 
-        # สร้าง JavaScript สำหรับ Marker ของแต่ละจุด
         markers_js = "".join(
             f"""
             new google.maps.Marker({{
@@ -581,7 +515,6 @@ with col_right:
             for loc in all_locs
         )
 
-        # สร้าง Polyline เชื่อมทุกจุด (ถ้ามีมากกว่า 1 จุด)
         polyline_js = ""
         if len(all_locs) > 1:
             path = ",".join(
@@ -597,7 +530,6 @@ with col_right:
             }}).setMap(map);
             """
 
-        # HTML สำหรับฝัง Google Maps ลงใน Streamlit
         map_html = f"""
         <!DOCTYPE html>
         <html>
@@ -631,5 +563,4 @@ with col_right:
         </html>
         """
 
-        # ฝังแผนที่เข้าไปในหน้า Streamlit
         st.components.v1.html(map_html, height=720)
