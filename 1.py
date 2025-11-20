@@ -9,6 +9,7 @@ import json
 import time
 import tempfile
 from typing import Dict, List, Optional, Tuple, Any
+from typing import cast
 
 import requests
 import streamlit as st
@@ -74,17 +75,13 @@ st.markdown(
 # =========================
 
 if "all_locations" not in st.session_state:
-    # เก็บรายการพิกัดที่ได้จาก Geocoding
-    st.session_state.all_locations: List[Dict[str, Any]] = []
+    st.session_state.all_locations = []
 
 if "extracted_data" not in st.session_state:
-    # เก็บผล JSON ที่ LLM สกัด (speed, altitude, destination)
-    st.session_state.extracted_data: Optional[Dict[str, List[str]]] = None
+    st.session_state.extracted_data = None
 
 if "transcript" not in st.session_state:
-    # เก็บข้อความที่ถอดเสียงมาจาก ASR
-    st.session_state.transcript: str = ""
-
+    st.session_state.transcript = ""
 
 # =========================
 # ส่วนที่ 3: Helper Functions
@@ -284,7 +281,7 @@ def extract_flight_info_llm(text: str) -> Dict[str, List[str]]:
                 time.sleep(1)
                 continue
 
-            st.error(f"LLM Error (ลองแล้ว {max_reTRIES} ครั้งยังไม่สำเร็จ): {e}")
+            st.error(f"LLM Error (ลองแล้ว {max_retries} ครั้งยังไม่สำเร็จ): {e}")
             return empty_result
 
     return empty_result
@@ -450,7 +447,6 @@ with col_left:
                     st.error(f"System Error: {e}")
         else:
             st.warning("⚠️ เสียงสั้นเกินไป (กรุณากดอัด > พูด > กดหยุด)")
-
 
     # แสดง Transcript ที่ถอดได้
     if st.session_state.transcript.strip():
