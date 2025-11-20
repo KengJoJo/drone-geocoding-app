@@ -635,7 +635,7 @@ with col_right:
                 function initMap() {{
                     const map = new google.maps.Map(document.getElementById("map"), {{
                         zoom: 13,
-                        center: {{lat: {center_lat}, lng: {center_lng}}}},
+                        center: {{lat: {center_lat}, lng: {center_lng}}},
                         mapTypeId: 'terrain'
                     }});
                     {markers_js}
