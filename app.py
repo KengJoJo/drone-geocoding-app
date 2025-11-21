@@ -20,9 +20,8 @@ from openai import OpenAI
 
 APP_TITLE = "🗺️ Drone Geocoding (Voice → JSON → Map)"
 
-# ใช้ Typhoon v2.5 เป็นตัวหลัก
+# ใช้ Typhoon v2.5 เป็น LLM หลัก
 TYPHOON_INSTRUCT_MODEL = "typhoon-v2.5-30b-a3b-instruct"
-TYPHOON_DEFAULT_MODEL = TYPHOON_INSTRUCT_MODEL
 TYPHOON_ASR_MODEL = "typhoon-asr-realtime"
 
 st.set_page_config(
@@ -31,6 +30,7 @@ st.set_page_config(
     page_icon="🗺️",
 )
 
+# CSS สำหรับปรับหน้าตา
 st.markdown(
     """
 <style>
@@ -63,9 +63,11 @@ st.markdown(
 # =========================
 
 if "all_locations" not in st.session_state:
+    # [{index, place_text, lat, lng, address}]
     st.session_state.all_locations: List[Dict[str, Any]] = []
 
 if "extracted_data" not in st.session_state:
+    # {"altitude": [...], "speed": [...], "destination": [...]}
     st.session_state.extracted_data: Optional[Dict[str, List[str]]] = None
 
 if "transcript" not in st.session_state:
@@ -110,8 +112,7 @@ def make_client() -> OpenAI:
     if not api_key:
         raise RuntimeError("ไม่พบ API Key (Typhoon/OpenAI)")
 
-    client = OpenAI(api_key=api_key, base_url=base_url)
-    return client
+    return OpenAI(api_key=api_key, base_url=base_url)
 
 
 def postprocess_text(text: str) -> str:
@@ -154,14 +155,42 @@ def extract_first_json_object(text: str) -> Optional[str]:
     return None
 
 
+def normalize_place_name(name: str) -> str:
+    """
+    ปรับชื่อสถานที่บางอันให้เข้ากับ Geocoding มากขึ้น
+    เช่น "มหาวิทยาลัยเกษตร" -> "มหาวิทยาลัยเกษตรศาสตร์"
+    """
+    s = re.sub(r"\s+", " ", str(name)).strip()
+
+    replacements = {
+        "มหาวิทยาลัยเกษตร": "มหาวิทยาลัยเกษตรศาสตร์",
+        "ม.เกษตร": "มหาวิทยาลัยเกษตรศาสตร์",
+        "มหาวิทยาลัยธรรมศาสตร์ศูนย์รังสิต": "มหาวิทยาลัยธรรมศาสตร์ ศูนย์รังสิต",
+        "ม.กรุงเทพ": "มหาวิทยาลัยกรุงเทพ",
+    }
+
+    return replacements.get(s, s)
+
+
 def build_user_prompt(transcribed: str) -> str:
     """
-    โครง prompt แบบ ty_text.py + ตัวอย่างมหาวิทยาลัยเกษตรศาสตร์
+    Prompt สำหรับ LLM:
+    - ดึง altitude, speed, destination
+    - แปลงคำอ่านตัวเลขไทย → ตัวเลขอารบิกในผลลัพธ์
     """
     examples = """
-ตัวอย่าง:
-คำสั่ง: "เริ่มบินจากมหาวิทยาลัยกรุงเทพ ไปมหาวิทยาลัยรังสิต แล้วไปมหาวิทยาลัยธรรมศาสตร์ ศูนย์รังสิต และสุดท้ายไปมหาวิทยาลัยเกษตรศาสตร์"
-JSON ที่ต้องการ:
+ตัวอย่างที่ 1
+คำสั่ง: "เริ่มบินจากมหาวิทยาลัยกรุงเทพ ด้วยความเร็วห้าสิบห้าเมตรต่อวินาที ที่ความสูงสี่สิบห้าเมตร ไปยังฟิวเจอร์ปาร์ครังสิต"
+คำตอบ JSON:
+{
+  "altitude": ["45 เมตร"],
+  "speed": ["55 เมตรต่อวินาที"],
+  "destination": ["มหาวิทยาลัยกรุงเทพ", "ฟิวเจอร์ปาร์ครังสิต"]
+}
+
+ตัวอย่างที่ 2
+คำสั่ง: "เริ่มบินจากมหาวิทยาลัยกรุงเทพ ไปมหาวิทยาลัยรังสิต แล้วไปมหาวิทยาลัยธรรมศาสตร์ ศูนย์รังสิต และสุดท้ายไปมหาวิทยาลัยเกษตร"
+คำตอบ JSON:
 {
   "altitude": [],
   "speed": [],
@@ -181,36 +210,20 @@ JSON ที่ต้องการ:
 }}
 
 กติกา:
-- ตอบเป็น JSON เพียงอย่างเดียว ห้ามมีคำอธิบาย ข้อความนำ/ปิด หรือโค้ดบล็อค
-- เรียงค่าตามลำดับที่ปรากฏในข้อความ
-- หน่วยให้คงตามต้นฉบับ (เช่น "เมตรต่อวินาที")
-- ถ้าไม่มีค่า ให้ส่ง array ว่าง []
-- ถ้าเจอคำว่า "มหาวิทยาลัยเกษตร" ให้แก้เป็น "มหาวิทยาลัยเกษตรศาสตร์"
+1) ตอบเป็น JSON เพียงอย่างเดียว ห้ามมีคำอธิบาย ข้อความนำ/ปิด หรือโค้ดบล็อค
+2) แปลงคำอ่านตัวเลขไทยใน altitude และ speed ให้เป็นตัวเลขอารบิกเสมอ เช่น
+   - "ยี่สิบเมตรต่อวินาที" → "20 เมตรต่อวินาที"
+   - "ห้าสิบเมตร" → "50 เมตร"
+3) destination ให้ดึงชื่อสถานที่ทุกแห่งที่กล่าวถึง เรียงตามลำดับที่ปรากฏ
+4) ถ้าไม่มีค่าให้ใช้ array ว่าง [] เช่น "altitude": []
+5) ถ้าเจอคำว่า "มหาวิทยาลัยเกษตร" หรือ "ม.เกษตร" ให้ใช้ในผลลัพธ์เป็น "มหาวิทยาลัยเกษตรศาสตร์"
 
+ตัวอย่าง:
 {examples}
 
-ข้อความอินพุต:
-"{transcribed.strip()}"
+ข้อความอินพุตจริง:
+\"\"\"{transcribed.strip()}\"\"\" 
 """
-
-
-def normalize_place_name(name: str) -> str:
-    """
-    แปลงชื่อสถานที่ให้เข้ากับ Geocoding มากขึ้น
-    เช่น "มหาวิทยาลัยเกษตร" -> "มหาวิทยาลัยเกษตรศาสตร์"
-    """
-    s = re.sub(r"\s+", " ", name).strip()
-
-    replacements = {
-        "มหาวิทยาลัยเกษตร": "มหาวิทยาลัยเกษตรศาสตร์",
-        "มหาวิทยาลัยธรรมศาสตร์ศูนย์รังสิต": "มหาวิทยาลัยธรรมศาสตร์ ศูนย์รังสิต",
-        "ม.กรุงเทพ": "มหาวิทยาลัยกรุงเทพ",
-    }
-
-    if s in replacements:
-        return replacements[s]
-
-    return s
 
 
 # =========================
@@ -219,7 +232,12 @@ def normalize_place_name(name: str) -> str:
 
 def extract_flight_info_llm(text: str) -> Dict[str, List[str]]:
     """
-    ใช้ Typhoon LLM แปลง "คำสั่งโดรน" → JSON
+    ใช้ Typhoon LLM แปลง "คำสั่งโดรน" → JSON:
+    {
+      "altitude": [...],
+      "speed": [...],
+      "destination": [...]
+    }
     """
     client = make_client()
 
@@ -231,7 +249,8 @@ def extract_flight_info_llm(text: str) -> Dict[str, List[str]]:
             "role": "system",
             "content": (
                 "You are Typhoon by SCB 10X. Respond ONLY in Thai when the user is Thai. "
-                "When asked for JSON, output a valid JSON object with no extra text."
+                "When asked for JSON, output a valid JSON object with no extra text. "
+                "Ensure Thai number words in altitude/speed are converted to Arabic numerals."
             ),
         },
         {
@@ -257,6 +276,7 @@ def extract_flight_info_llm(text: str) -> Dict[str, List[str]]:
 
             data = json.loads(json_str)
 
+            # กันเคสโมเดลลืม key หรือให้ type แปลก ๆ
             for key in ["altitude", "speed", "destination"]:
                 if key not in data or not isinstance(data[key], list):
                     data[key] = []
@@ -339,49 +359,35 @@ gmaps_key = load_google_maps_key()
 
 col_left, col_right = st.columns([0.4, 0.6], gap="medium")
 
-# ---------- คอลัมน์ซ้าย ----------
+# ---------- คอลัมน์ซ้าย: Voice → JSON ----------
 with col_left:
-    st.subheader("① สั่งงานด้วยเสียง")
-
-    mode = st.radio(
-        "เลือกวิธีนำเข้าเสียง",
-        ["อัดเสียงผ่านหน้าเว็บ", "อัปโหลดไฟล์เสียง (แนะนำ: อัดจากมือถือแล้วเอามาอัปโหลด)"],
-        index=0,
-    )
+    st.subheader("① สั่งงานด้วยเสียง (อัดจากไมค์หน้าเว็บ)")
 
     audio_bytes: Optional[bytes] = None
 
-    if mode == "อัดเสียงผ่านหน้าเว็บ":
-        try:
-            from audio_recorder_streamlit import audio_recorder
+    try:
+        from audio_recorder_streamlit import audio_recorder
 
-            audio_bytes = audio_recorder(
-                text="แตะเพื่อเริ่ม / แตะเพื่อหยุด",
-                recording_color="#e74c3c",
-                neutral_color="#34495e",
-                icon_size="3x",
-                pause_threshold=30.0,
-                sample_rate=44100,
-            )
-        except Exception:
-            st.error("กรุณาติดตั้งแพ็กเกจ: pip install audio-recorder-streamlit")
-    else:
-        uploaded_file = st.file_uploader(
-            "อัปโหลดไฟล์เสียง (รองรับ .wav, .mp3, .m4a ฯลฯ)",
-            type=["wav", "mp3", "m4a", "ogg", "flac"],
+        audio_bytes = audio_recorder(
+            text="แตะเพื่อเริ่ม / แตะเพื่อหยุด",
+            recording_color="#e74c3c",
+            neutral_color="#34495e",
+            icon_size="3x",
+            pause_threshold=30.0,  # ให้พูดจบเองแล้วค่อยกดหยุด
+            sample_rate=44100,
         )
-        if uploaded_file is not None:
-            audio_bytes = uploaded_file.read()
-            st.audio(audio_bytes, format="audio/wav")
+    except Exception:
+        st.error("กรุณาติดตั้งแพ็กเกจ: pip install audio-recorder-streamlit")
 
     # ถ้ามีเสียง
     if audio_bytes:
         if len(audio_bytes) > 2000:
+            # เคลียร์ state เดิม
             st.session_state.all_locations = []
             st.session_state.extracted_data = None
             st.session_state.transcript = ""
 
-            with st.spinner("🔊 กำลังถอดความและวิเคราะห์"):
+            with st.spinner("🔊 กำลังถอดความและวิเคราะห์..."):
                 try:
                     # 1) ASR
                     transcript = typhoon_transcribe(audio_bytes)
@@ -392,14 +398,14 @@ with col_left:
                         extracted = extract_flight_info_llm(transcript)
                         st.session_state.extracted_data = extracted
 
-                        # 3) Geocoding
+                        # 3) Geocoding ทุก destination
                         destinations = extracted.get("destination", [])
 
                         with st.expander("🔍 Debug: สถานที่ที่ส่งไป Geocoding", expanded=False):
                             st.write(destinations)
 
                         for idx, raw_name in enumerate(destinations, start=1):
-                            place_name = normalize_place_name(str(raw_name))
+                            place_name = normalize_place_name(raw_name)
 
                             loc_data, raw = geocode_location_google(place_name, gmaps_key)
                             if loc_data:
@@ -421,7 +427,7 @@ with col_left:
                 except Exception as e:
                     st.error(f"System Error: {e}")
         else:
-            st.warning("⚠️ เสียงสั้นเกินไป (กรุณากดอัด > พูด > กดหยุด)")
+            st.warning("⚠️ เสียงสั้นเกินไป (กรุณากดอัด > พูดคำสั่งยาวพอสมควร > กดหยุด)")
 
     # ② Transcript
     if st.session_state.transcript.strip():
@@ -442,7 +448,7 @@ with col_left:
         c2.metric("Altitude", altitude)
         c3.metric("Destinations", dest_count)
 
-        with st.expander("ดู JSON เต็ม + Debug โมเดลที่ใช้"):
+        with st.expander("ดู JSON เต็ม (ใช้ LLM รุ่นอะไร)"):
             st.write({"llm_model": TYPHOON_INSTRUCT_MODEL, "asr_model": TYPHOON_ASR_MODEL})
             st.json(data)
 
@@ -455,7 +461,7 @@ with col_left:
                 st.caption(loc["address"])
 
 
-# ---------- คอลัมน์ขวา ----------
+# ---------- คอลัมน์ขวา: แผนที่ Google Maps ----------
 with col_right:
     st.subheader("⑤ แผนที่เส้นทางบิน")
 
@@ -466,7 +472,7 @@ with col_right:
             """
             <div style='height:650px; border:2px dashed #555; border-radius:12px; 
                  display:flex; align-items:center; justify-content:center; color:#888;'>
-                รอข้อมูลพิกัด... (กรุณาอัดเสียงหรืออัปโหลดไฟล์เสียง แล้วสั่งงาน)
+                รอข้อมูลพิกัด... (กรุณาอัดเสียงแล้วสั่งงาน)
             </div>
             """,
             unsafe_allow_html=True,
