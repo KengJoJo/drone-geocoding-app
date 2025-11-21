@@ -1,27 +1,44 @@
 # app.py
-import os, re, tempfile, json, time
+
+# =========================
+# ส่วน import library ที่ใช้ในโปรเจกต์
+# =========================
+import os
+import re
+import json
+import time
+import tempfile
+from typing import Dict, List, Optional, Tuple, Any
+
 import requests
 import streamlit as st
 from openai import OpenAI
 
 # =========================
-# 1. Config & CSS
+# ส่วนที่ 1: Global Config & CSS
 # =========================
+
+APP_TITLE = "🗺️ Drone Geocoding (Voice → JSON → Map)"
+
+# ใช้ Typhoon v2.5 เป็นตัวหลัก
+TYPHOON_INSTRUCT_MODEL = "typhoon-v2.5-30b-a3b-instruct"
+TYPHOON_DEFAULT_MODEL = TYPHOON_INSTRUCT_MODEL
+TYPHOON_ASR_MODEL = "typhoon-asr-realtime"
+
 st.set_page_config(
     page_title="Drone Geocoding",
     layout="wide",
     page_icon="🗺️",
 )
 
-st.markdown("""
+st.markdown(
+    """
 <style>
-    /* ขยายหน้าจอให้กว้าง 95% */
     .block-container {
         max-width: 95% !important;
         padding-top: 2rem;
         padding-bottom: 2rem;
     }
-    /* แต่ง Expander และ Metric */
     .stExpander {
         background-color: rgba(255, 255, 255, 0.02);
         border-radius: 10px;
@@ -32,284 +49,491 @@ st.markdown("""
         padding: 10px;
         text-align: center;
     }
-    /* จัดปุ่มอัดเสียงให้อยู่ตรงกลาง */
     .stAudioRecorder {
         display: flex;
-        justify_content: center;
+        justify-content: center;
     }
 </style>
-""", unsafe_allow_html=True)
-
-APP_TITLE = "🗺️ Drone Geocoding (Voice → JSON → Map)"
-
-# =========================
-# 2. Session State
-# =========================
-if "all_locations" not in st.session_state: st.session_state.all_locations = []
-if "extracted_data" not in st.session_state: st.session_state.extracted_data = None
-if "transcript" not in st.session_state: st.session_state.transcript = ""
+""",
+    unsafe_allow_html=True,
+)
 
 # =========================
-# 3. Helper Functions
+# ส่วนที่ 2: Session State
 # =========================
-def load_google_maps_key():
+
+if "all_locations" not in st.session_state:
+    st.session_state.all_locations: List[Dict[str, Any]] = []
+
+if "extracted_data" not in st.session_state:
+    st.session_state.extracted_data: Optional[Dict[str, List[str]]] = None
+
+if "transcript" not in st.session_state:
+    st.session_state.transcript: str = ""
+
+
+# =========================
+# ส่วนที่ 3: Helper Functions
+# =========================
+
+def load_google_maps_key() -> Optional[str]:
+    """โหลด Google Maps API Key จาก st.secrets หรือ env vars"""
     try:
-        key = st.secrets.get("GOOGLE_MAPS_API_KEY") or st.secrets.get("GOOGLE_API_KEY")
-        if key: return key
-    except: pass
+        key = (
+            st.secrets.get("GOOGLE_MAPS_API_KEY")
+            or st.secrets.get("GOOGLE_API_KEY")
+        )
+        if key:
+            return key
+    except Exception:
+        pass
+
     return os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
-def make_client():
+
+def make_client() -> OpenAI:
+    """สร้าง Typhoon/OpenAI client จาก key + base_url"""
+    api_key = None
+    base_url = None
+
     try:
-        key   = st.secrets.get("OPENTYPHOON_API_KEY") or st.secrets.get("OPENAI_API_KEY")
-        base  = st.secrets.get("OPENTYPHOON_BASE_URL") or st.secrets.get("OPENAI_BASE_URL")
-        model = st.secrets.get("TYPHOON_MODEL")
-    except: key = base = model = None
+        api_key = st.secrets.get("OPENTYPHOON_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+        base_url = st.secrets.get("OPENTYPHOON_BASE_URL") or st.secrets.get("OPENAI_BASE_URL")
+    except Exception:
+        pass
 
-    if not key: key = os.getenv("OPENTYPHOON_API_KEY") or os.getenv("OPENAI_API_KEY")
-    if not base: base = os.getenv("OPENTYPHOON_BASE_URL") or os.getenv("OPENAI_BASE_URL")
-    model = model or "typhoon-v1.5x-70b-instruct"
+    if not api_key:
+        api_key = os.getenv("OPENTYPHOON_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not base_url:
+        base_url = os.getenv("OPENTYPHOON_BASE_URL") or os.getenv("OPENAI_BASE_URL")
 
-    if not key: raise RuntimeError("ไม่พบ API Key (Typhoon/OpenAI)")
-    return OpenAI(api_key=key, base_url=base), model
+    if not api_key:
+        raise RuntimeError("ไม่พบ API Key (Typhoon/OpenAI)")
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    return client
+
 
 def postprocess_text(text: str) -> str:
-    if not text: return ""
+    """จัดรูปแบบข้อความที่ได้จาก ASR"""
+    if not text:
+        return ""
     x = re.sub(r"\s+", " ", text).strip()
     x = re.sub(r"(?<=[ก-๛A-Za-z])(?=\d)", " ", x)
     x = re.sub(r"(?<=\d)(?=[ก-๛A-Za-z])", " ", x)
     return x
 
-# =========================
-# 4. Core Logic (AI & Geocoding)
-# =========================
-def extract_first_json_object(text: str):
+
+def extract_first_json_object(text: str) -> Optional[str]:
+    """ดึง JSON object แรกจากข้อความที่โมเดลตอบกลับมา"""
+    if not text:
+        return None
+
     s = text.strip()
+
     if s.startswith("```"):
         lines = s.splitlines()
-        if lines and lines[0].startswith("```"): lines = lines[1:]
-        if lines and lines[-1].strip() == "```": lines = lines[:-1]
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
         s = "\n".join(lines).strip()
+
     start = s.find("{")
-    if start == -1: return None
+    if start == -1:
+        return None
+
     depth = 0
-    for i in range(start, len(s)):
-        ch = s[i]
-        if ch == "{": depth += 1
+    for i, ch in enumerate(s[start:], start=start):
+        if ch == "{":
+            depth += 1
         elif ch == "}":
             depth -= 1
-            if depth == 0: return s[start : i + 1]
+            if depth == 0:
+                return s[start: i + 1]
     return None
 
-def extract_flight_info_llm(text: str):
-    """
-    ใช้ Typhoon แยก JSON พร้อมระบบ Retry และแก้คำผิด/แปลงตัวเลข
-    """
-    client, model = make_client()
-    
-    # Prompt สั่งให้แปลงตัวเลขและแก้คำผิด
-    prompt = f"""ภารกิจ: อ่านข้อความคำสั่งโดรน (ซึ่งอาจมีคำผิดจาก ASR) แล้วแปลงเป็น JSON
-Schema:
-{{
-  "altitude": ["<ตัวเลขและหน่วย>"],
-  "speed": ["<ตัวเลขและหน่วย>"],
-  "destination": ["<ชื่อสถานที่>"]
-}}
-เงื่อนไขสำคัญ:
-1. **แปลงคำอ่านตัวเลข (เช่น "ยี่สิบ", "เก้าสิบ") ให้เป็นตัวเลขอารบิก (20, 90) เสมอ**
-2. แก้คำผิดตามบริบทการบิน เช่น "พยาน"->"ทะยาน", "มังกรุงเทพ"->"ม.กรุงเทพ"
-3. ตอบเป็น JSON เท่านั้น ห้ามมีคำอธิบายอื่น
 
-ข้อความ input: "{text.strip()}"
+def build_user_prompt(transcribed: str) -> str:
+    """
+    โครง prompt แบบ ty_text.py + ตัวอย่างมหาวิทยาลัยเกษตรศาสตร์
+    """
+    examples = """
+ตัวอย่าง:
+คำสั่ง: "เริ่มบินจากมหาวิทยาลัยกรุงเทพ ไปมหาวิทยาลัยรังสิต แล้วไปมหาวิทยาลัยธรรมศาสตร์ ศูนย์รังสิต และสุดท้ายไปมหาวิทยาลัยเกษตรศาสตร์"
+JSON ที่ต้องการ:
+{
+  "altitude": [],
+  "speed": [],
+  "destination": [
+    "มหาวิทยาลัยกรุงเทพ",
+    "มหาวิทยาลัยรังสิต",
+    "มหาวิทยาลัยธรรมศาสตร์ ศูนย์รังสิต",
+    "มหาวิทยาลัยเกษตรศาสตร์"
+  ]
+}
 """
-    
-    # Retry Logic: ลองยิงซ้ำ 3 รอบถ้าเจอ Error 500
+    return f"""ภารกิจ: อ่านคำสั่งควบคุมโดรน และดึงค่าเป็น JSON "อย่างเดียว" ตามสคีมาต่อไปนี้:
+{{
+  "altitude": ["<ตัวเลขและหน่วย>","..."],
+  "speed": ["<ตัวเลขและหน่วย>","..."],
+  "destination": ["<ชื่อสถานที่>","..."]
+}}
+
+กติกา:
+- ตอบเป็น JSON เพียงอย่างเดียว ห้ามมีคำอธิบาย ข้อความนำ/ปิด หรือโค้ดบล็อค
+- เรียงค่าตามลำดับที่ปรากฏในข้อความ
+- หน่วยให้คงตามต้นฉบับ (เช่น "เมตรต่อวินาที")
+- ถ้าไม่มีค่า ให้ส่ง array ว่าง []
+- ถ้าเจอคำว่า "มหาวิทยาลัยเกษตร" ให้แก้เป็น "มหาวิทยาลัยเกษตรศาสตร์"
+
+{examples}
+
+ข้อความอินพุต:
+"{transcribed.strip()}"
+"""
+
+
+def normalize_place_name(name: str) -> str:
+    """
+    แปลงชื่อสถานที่ให้เข้ากับ Geocoding มากขึ้น
+    เช่น "มหาวิทยาลัยเกษตร" -> "มหาวิทยาลัยเกษตรศาสตร์"
+    """
+    s = re.sub(r"\s+", " ", name).strip()
+
+    replacements = {
+        "มหาวิทยาลัยเกษตร": "มหาวิทยาลัยเกษตรศาสตร์",
+        "มหาวิทยาลัยธรรมศาสตร์ศูนย์รังสิต": "มหาวิทยาลัยธรรมศาสตร์ ศูนย์รังสิต",
+        "ม.กรุงเทพ": "มหาวิทยาลัยกรุงเทพ",
+    }
+
+    if s in replacements:
+        return replacements[s]
+
+    return s
+
+
+# =========================
+# ส่วนที่ 4: Core Logic (AI & Geocoding)
+# =========================
+
+def extract_flight_info_llm(text: str) -> Dict[str, List[str]]:
+    """
+    ใช้ Typhoon LLM แปลง "คำสั่งโดรน" → JSON
+    """
+    client = make_client()
+
     max_retries = 3
+    empty_result: Dict[str, List[str]] = {"altitude": [], "speed": [], "destination": []}
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are Typhoon by SCB 10X. Respond ONLY in Thai when the user is Thai. "
+                "When asked for JSON, output a valid JSON object with no extra text."
+            ),
+        },
+        {
+            "role": "user",
+            "content": build_user_prompt(text),
+        },
+    ]
+
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model="typhoon-v2.5-30b-a3b-instruct",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant. Output valid JSON only. Convert text numbers to digits."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1, max_tokens=512
+                model=TYPHOON_INSTRUCT_MODEL,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=512,
             )
-            json_str = extract_first_json_object(response.choices[0].message.content)
-            
-            if json_str:
-                return json.loads(json_str)
-            else:
-                # ถ้า LLM ตอบกลับมาแต่แกะ JSON ไม่ได้ ให้คืนค่าว่าง
-                return {"altitude":[], "speed":[], "destination":[]}
-                
+
+            raw_content = response.choices[0].message.content or ""
+            json_str = extract_first_json_object(raw_content)
+
+            if not json_str:
+                return empty_result
+
+            data = json.loads(json_str)
+
+            for key in ["altitude", "speed", "destination"]:
+                if key not in data or not isinstance(data[key], list):
+                    data[key] = []
+
+            return data
+
         except Exception as e:
-            # ถ้ายังไม่ครบโควตา ให้รอแป๊บแล้วลองใหม่
             if attempt < max_retries - 1:
-                time.sleep(1) # รอ 1 วินาที
+                time.sleep(1)
                 continue
-            else:
-                st.error(f"LLM Error (หลังจากลอง {max_retries} ครั้ง): {e}")
-                return {"altitude":[], "speed":[], "destination":[]}
+
+            st.error(f"LLM Error (ลองแล้ว {max_retries} ครั้งยังไม่สำเร็จ): {e}")
+            return empty_result
+
+    return empty_result
+
 
 def typhoon_transcribe(audio_bytes: bytes) -> str:
-    client, model = make_client()
-    model_asr = "typhoon-asr-realtime"
-    
+    """
+    ใช้ Typhoon ASR ถอดเสียงจาก audio_bytes → ข้อความภาษาไทย
+    """
+    client = make_client()
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
+
     try:
         with open(tmp_path, "rb") as f:
-            resp = client.audio.transcriptions.create(model=model_asr, file=f)
-        return postprocess_text((getattr(resp, "text", "") or "").strip())
+            resp = client.audio.transcriptions.create(
+                model=TYPHOON_ASR_MODEL,
+                file=f,
+            )
+        text = getattr(resp, "text", "") or ""
+        return postprocess_text(text.strip())
     finally:
-        try: os.unlink(tmp_path)
-        except: pass
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
-def geocode_location_google(q, api_key):
-    if not q or not api_key: return None, None
+
+def geocode_location_google(
+    query: str, api_key: Optional[str]
+) -> Tuple[Optional[Tuple[float, float, str]], Optional[Dict[str, Any]]]:
+    """
+    ใช้ Google Geocoding API แปลงชื่อสถานที่ (query) → พิกัด
+    """
+    if not query or not api_key:
+        return None, None
+
     try:
-        url = "[https://maps.googleapis.com/maps/api/geocode/json](https://maps.googleapis.com/maps/api/geocode/json)"
-        r = requests.get(url, params={"address": q, "key": api_key, "language": "th"}, timeout=5)
-        data = r.json()
-        if data.get("results"):
-            loc = data["results"][0]["geometry"]["location"]
-            return (loc["lat"], loc["lng"], data["results"][0]["formatted_address"]), data
-    except Exception as e: return None, {"error": str(e)}
+        url = "https://maps.googleapis.com/maps/api/geocode/json"
+        params = {
+            "address": query,
+            "key": api_key,
+            "language": "th",
+        }
+        response = requests.get(url, params=params, timeout=5)
+        data = response.json()
+
+        results = data.get("results")
+        if results:
+            loc = results[0]["geometry"]["location"]
+            formatted_address = results[0]["formatted_address"]
+            return (loc["lat"], loc["lng"], formatted_address), data
+
+        return None, data
+
+    except Exception as e:
+        return None, {"error": str(e)}
+
 
 # =========================
-# 5. UI Layout
+# ส่วนที่ 5: UI Layout (หน้าเว็บหลัก)
 # =========================
+
 st.title(APP_TITLE)
 gmaps_key = load_google_maps_key()
 
-colL, colR = st.columns([0.4, 0.6], gap="medium")
+col_left, col_right = st.columns([0.4, 0.6], gap="medium")
 
-# === LEFT COLUMN ===
-with colL:
+# ---------- คอลัมน์ซ้าย ----------
+with col_left:
     st.subheader("① สั่งงานด้วยเสียง")
-    
-    audio_bytes = None
-    try:
-        from audio_recorder_streamlit import audio_recorder
-        # pause_threshold=600.0 -> ห้ามตัดเองจนกว่าจะครบ 10 นาที
-        audio_bytes = audio_recorder(
-            text="แตะเพื่อเริ่ม / แตะเพื่อหยุด",
-            recording_color="#e74c3c",
-            neutral_color="#34495e",
-            icon_size="3x",
-            pause_threshold=600.0, 
-            sample_rate=44100
-        )
-    except:
-        st.error("Please install: pip install audio-recorder-streamlit")
 
+    mode = st.radio(
+        "เลือกวิธีนำเข้าเสียง",
+        ["อัดเสียงผ่านหน้าเว็บ", "อัปโหลดไฟล์เสียง (แนะนำ: อัดจากมือถือแล้วเอามาอัปโหลด)"],
+        index=0,
+    )
+
+    audio_bytes: Optional[bytes] = None
+
+    if mode == "อัดเสียงผ่านหน้าเว็บ":
+        try:
+            from audio_recorder_streamlit import audio_recorder
+
+            audio_bytes = audio_recorder(
+                text="แตะเพื่อเริ่ม / แตะเพื่อหยุด",
+                recording_color="#e74c3c",
+                neutral_color="#34495e",
+                icon_size="3x",
+                pause_threshold=30.0,
+                sample_rate=44100,
+            )
+        except Exception:
+            st.error("กรุณาติดตั้งแพ็กเกจ: pip install audio-recorder-streamlit")
+    else:
+        uploaded_file = st.file_uploader(
+            "อัปโหลดไฟล์เสียง (รองรับ .wav, .mp3, .m4a ฯลฯ)",
+            type=["wav", "mp3", "m4a", "ogg", "flac"],
+        )
+        if uploaded_file is not None:
+            audio_bytes = uploaded_file.read()
+            st.audio(audio_bytes, format="audio/wav")
+
+    # ถ้ามีเสียง
     if audio_bytes:
-        # Check File Size > 2KB
         if len(audio_bytes) > 2000:
             st.session_state.all_locations = []
             st.session_state.extracted_data = None
             st.session_state.transcript = ""
-            
-            with st.spinner("🔊 กำลังถอดความและวิเคราะห์ (AI)..."):
+
+            with st.spinner("🔊 กำลังถอดความและวิเคราะห์"):
                 try:
-                    # 1. Transcribe
-                    text_val = typhoon_transcribe(audio_bytes)
-                    st.write(text_val)
-                    st.session_state.transcript = text_val
-                    
-                    # 2. Extract JSON (Retry & Convert built-in)
-                    if text_val:
-                        extracted = extract_flight_info_llm(text_val)
+                    # 1) ASR
+                    transcript = typhoon_transcribe(audio_bytes)
+                    st.session_state.transcript = transcript
+
+                    # 2) LLM → JSON
+                    if transcript:
+                        extracted = extract_flight_info_llm(transcript)
                         st.session_state.extracted_data = extracted
-                        
-                        # 3. Geocode
-                        dests = extracted.get("destination", [])
-                        for idx, place in enumerate(dests):
-                            loc_data, raw = geocode_location_google(place, gmaps_key)
+
+                        # 3) Geocoding
+                        destinations = extracted.get("destination", [])
+
+                        with st.expander("🔍 Debug: สถานที่ที่ส่งไป Geocoding", expanded=False):
+                            st.write(destinations)
+
+                        for idx, raw_name in enumerate(destinations, start=1):
+                            place_name = normalize_place_name(str(raw_name))
+
+                            loc_data, raw = geocode_location_google(place_name, gmaps_key)
                             if loc_data:
-                                st.session_state.all_locations.append({
-                                    "index": idx + 1, "place_text": place,
-                                    "lat": loc_data[0], "lng": loc_data[1],
-                                    "address": loc_data[2]
-                                })
+                                lat, lng, address = loc_data
+                                st.session_state.all_locations.append(
+                                    {
+                                        "index": idx,
+                                        "place_text": place_name,
+                                        "lat": lat,
+                                        "lng": lng,
+                                        "address": address,
+                                    }
+                                )
+                            else:
+                                status = raw.get("status") if isinstance(raw, dict) else "no_raw"
+                                st.warning(
+                                    f"Geocoding หาไม่เจอสำหรับ {repr(place_name)} (status={status})"
+                                )
                 except Exception as e:
                     st.error(f"System Error: {e}")
         else:
             st.warning("⚠️ เสียงสั้นเกินไป (กรุณากดอัด > พูด > กดหยุด)")
 
-    # Show Results
-    if st.session_state.transcript:
+    # ② Transcript
+    if st.session_state.transcript.strip():
+        st.markdown("### ② ข้อความที่ได้จากการถอดเสียง (ASR)")
         st.info(f"🗣️ **ข้อความ:** {st.session_state.transcript}")
 
+    # ③ JSON
     if st.session_state.extracted_data:
-        st.markdown("### ③ ข้อมูล JSON (V, H, L)")
+        st.markdown("### ③ ข้อมูลคำสั่งที่สกัดเป็น JSON")
+
         data = st.session_state.extracted_data
-        
+        speed = ", ".join(data.get("speed", [])) or "-"
+        altitude = ", ".join(data.get("altitude", [])) or "-"
+        dest_count = len(data.get("destination", []))
+
         c1, c2, c3 = st.columns(3)
-        c1.metric("Speed", ", ".join(data.get("speed", [])) or "-")
-        c2.metric("Altitude", ", ".join(data.get("altitude", [])) or "-")
-        c3.metric("Destinations", str(len(data.get("destination", []))))
-        
-        with st.expander("ดู JSON"):
+        c1.metric("Speed", speed)
+        c2.metric("Altitude", altitude)
+        c3.metric("Destinations", dest_count)
+
+        with st.expander("ดู JSON เต็ม + Debug โมเดลที่ใช้"):
+            st.write({"llm_model": TYPHOON_INSTRUCT_MODEL, "asr_model": TYPHOON_ASR_MODEL})
             st.json(data)
 
+    # ④ รายการพิกัด
     if st.session_state.all_locations:
-        st.markdown("### ④ รายการพิกัด")
+        st.markdown("### ④ รายการพิกัดที่ได้จาก Geocoding")
         for loc in st.session_state.all_locations:
             with st.expander(f"#{loc['index']} {loc['place_text']}"):
                 st.write(f"{loc['lat']:.5f}, {loc['lng']:.5f}")
-                st.caption(loc['address'])
+                st.caption(loc["address"])
 
-# === RIGHT COLUMN ===
-with colR:
-    st.subheader("🗺️ แผนที่เส้นทางบิน")
-    
+
+# ---------- คอลัมน์ขวา ----------
+with col_right:
+    st.subheader("⑤ แผนที่เส้นทางบิน")
+
     if not gmaps_key:
-        st.warning("⚠️ ไม่พบ Google Maps API Key")
+        st.warning("⚠️ ไม่พบ Google Maps API Key (กรุณาตั้งค่าใน st.secrets หรือ Environment variable)")
     elif not st.session_state.all_locations:
         st.markdown(
-            """<div style='height:650px; border:2px dashed #555; border-radius:12px; 
-            display:flex; align-items:center; justify-content:center; color:#888;'>
-            รอข้อมูลพิกัด... (กรุณากดอัดเสียง)
-            </div>""", unsafe_allow_html=True)
+            """
+            <div style='height:650px; border:2px dashed #555; border-radius:12px; 
+                 display:flex; align-items:center; justify-content:center; color:#888;'>
+                รอข้อมูลพิกัด... (กรุณาอัดเสียงหรืออัปโหลดไฟล์เสียง แล้วสั่งงาน)
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     else:
         all_locs = st.session_state.all_locations
-        c_lat = sum(l['lat'] for l in all_locs) / len(all_locs)
-        c_lng = sum(l['lng'] for l in all_locs) / len(all_locs)
-        
-        markers = "".join([f"""
+        center_lat = sum(l["lat"] for l in all_locs) / len(all_locs)
+        center_lng = sum(l["lng"] for l in all_locs) / len(all_locs)
+
+        markers_js = "".join(
+            f"""
             new google.maps.Marker({{
-                position: {{lat: {l['lat']}, lng: {l['lng']}}},
-                map: map, label: '{l['index']}', title: '{l['place_text']}'
-            }});""" for l in all_locs])
-            
-        poly = ""
+                position: {{lat: {loc['lat']}, lng: {loc['lng']}}},
+                map: map,
+                label: '{loc['index']}',
+                title: '{loc['place_text']}'
+            }});
+            """
+            for loc in all_locs
+        )
+
+        polyline_js = ""
         if len(all_locs) > 1:
-            path = ",".join([f"{{lat: {l['lat']}, lng: {l['lng']}}}" for l in all_locs])
-            poly = f"""
+            path = ",".join(
+                f"{{lat: {loc['lat']}, lng: {loc['lng']}}}"
+                for loc in all_locs
+            )
+            polyline_js = f"""
             new google.maps.Polyline({{
-                path: [{path}], geodesic: true, strokeColor: "#FF0000", strokeWeight: 3
-            }}).setMap(map);"""
+                path: [{path}],
+                geodesic: true,
+                strokeColor: "#FF0000",
+                strokeWeight: 3
+            }}).setMap(map);
+            """
 
         map_html = f"""
         <!DOCTYPE html>
         <html>
-        <head><style>#map {{height:700px;width:100%;border-radius:12px;}} body{{margin:0;}}</style></head>
+        <head>
+            <style>
+                #map {{
+                    height: 700px;
+                    width: 100%;
+                    border-radius: 12px;
+                }}
+                body {{
+                    margin: 0;
+                }}
+            </style>
+        </head>
         <body>
             <div id="map"></div>
             <script>
                 function initMap() {{
                     const map = new google.maps.Map(document.getElementById("map"), {{
-                        zoom: 13, center: {{lat: {c_lat}, lng: {c_lng}}},
+                        zoom: 13,
+                        center: {{lat: {center_lat}, lng: {center_lng}}},
                         mapTypeId: 'terrain'
                     }});
-                    {markers} {poly}
+                    {markers_js}
+                    {polyline_js}
                 }}
             </script>
-            <script src="[https://maps.googleapis.com/maps/api/js?key=](https://maps.googleapis.com/maps/api/js?key=){gmaps_key}&callback=initMap" async defer></script>
+            <script src="https://maps.googleapis.com/maps/api/js?key={gmaps_key}&callback=initMap" async defer></script>
         </body>
         </html>
         """
+
         st.components.v1.html(map_html, height=720)
